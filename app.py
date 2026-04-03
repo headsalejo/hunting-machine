@@ -1,0 +1,1336 @@
+"""
+Hunting Machine — 4-Stage Account Intelligence Pipeline
+Claude Sonnet 4.6 + Apollo.io
+"""
+
+import streamlit as st
+import pandas as pd
+import json
+import io
+import time
+import requests
+import anthropic
+from datetime import datetime, timezone
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+CLAUDE_MODEL        = "claude-sonnet-4-6"
+BATCH_SIZE          = 10
+APOLLO_MIN_SCORE    = 28
+APOLLO_DELAY    = 0.6
+
+SALESFORCE_KW   = {"salesforce","sales cloud","service cloud","marketing cloud",
+                   "commerce cloud","data cloud","pardot","tableau","mulesoft",
+                   "heroku","slack","exacttarget"}
+COMPETITOR_KW   = {"dynamics","microsoft dynamics","hubspot","sap crm","zoho","freshsales"}
+CRM_HIRING_KW   = {"salesforce","crm","sales cloud","service cloud",
+                   "marketing cloud","data cloud","agentforce"}
+TIER_ORDER      = {"A Strategic":0,"B Prime":1,"C Monitor":2,"Low Priority":3,"Remove":4}
+
+# ── Page setup ────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Hunting Machine", page_icon="🎯", layout="wide")
+st.title("🎯 Hunting Machine")
+st.markdown("4-stage account intelligence · **Claude Sonnet 4.6** + **Apollo.io**")
+
+# ── Sidebar ───────────────────────────────────────────────────────────────────
+st.sidebar.title("⚙️ Configuration")
+anthropic_key = st.sidebar.text_input("Anthropic API Key", type="password")
+apollo_key    = st.sidebar.text_input("Apollo API Key", type="password")
+ae_name       = st.sidebar.text_input("AE Name (source tag)", placeholder="e.g. Alvaro")
+st.sidebar.markdown("---")
+st.sidebar.markdown("""
+**Pipeline**
+1. 📂 Upload lists
+2. 🔍 Pre-filter (binary qualification)
+3. 🧠 Claude first tiering
+4. ✏️ Manual review gate
+5. 🔍 Apollo enrichment (score ≥ 28)
+6. 👥 Lead intelligence
+7. ✉️ Outreach generation
+8. 📥 Download
+""")
+
+# ── Session state ─────────────────────────────────────────────────────────────
+for k, default in [
+    ("stage",            0),
+    ("prefilter_done",   False),
+    ("prefilter_results",[]),
+    ("company_sources",  {}),
+    ("stage1_results",   []),
+    ("stage2_results",   []),
+    ("stage3a_results",  {}),
+    ("stage3_results",   []),
+    ("stage4_results",   []),
+]:
+    if k not in st.session_state:
+        st.session_state[k] = default
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# HELPERS — File loading
+# ════════════════════════════════════════════════════════════════════════════════
+def load_companies(f, source):
+    companies = []
+    name = f.name.lower()
+    if name.endswith(".csv"):
+        df = pd.read_csv(f)
+        col = df.columns[0]
+        for k1, k2 in [("company","name"), ("account","name")]:
+            m = next((c for c in df.columns if k1 in c.lower() and k2 in c.lower()), None)
+            if m:
+                col = m
+                break
+        companies = df[col].dropna().tolist()
+    elif name.endswith(".json"):
+        data = json.load(f)
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, str):
+                    companies.append(item)
+                elif isinstance(item, dict):
+                    for key in ["company_name","Company","Account Name","name"]:
+                        if key in item and item[key]:
+                            companies.append(item[key])
+                            break
+        elif isinstance(data, dict):
+            for key in ["accounts","companies","data"]:
+                if key in data and isinstance(data[key], list):
+                    for item in data[key]:
+                        c = item.get("company_name") or item.get("Company") or item.get("name","")
+                        if c:
+                            companies.append(c)
+                    break
+    return [(c.strip(), source) for c in companies if isinstance(c, str) and c.strip()]
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# HELPERS — Apollo
+# ════════════════════════════════════════════════════════════════════════════════
+def apollo_post(endpoint, payload, key):
+    url = f"https://api.apollo.io/v1/{endpoint}"
+    r = requests.post(url, json=payload,
+                      headers={"Content-Type":"application/json","X-Api-Key":key},
+                      timeout=20)
+    r.raise_for_status()
+    time.sleep(APOLLO_DELAY)
+    return r.json()
+
+def claude_resolve_names(company_list, key):
+    """Use Claude's semantic knowledge to resolve Iberian company names to their
+    most likely Apollo-indexed form (international legal name + domain)."""
+    block = "\n".join(f"- {c}" for c in company_list)
+    prompt = f"""You are resolving Iberian company names to their most likely Apollo.io database entries.
+Apollo indexes companies by their international/English legal name, not their Spanish trade name.
+
+For each company return:
+- canonical_name: most likely Apollo-indexed name (international/English legal name)
+- domain: primary web domain if you know it (e.g. mahou.es, mango.com) — empty string if unsure
+- alt_names: up to 2 fallback name variants to try if canonical fails
+
+COMPANIES:
+{block}
+
+Resolution examples:
+- "Grupo Mahou San Miguel" → canonical: "Mahou-San Miguel Group", domain: "mahou.es"
+- "El Corte Inglés" → canonical: "El Corte Ingles", domain: "elcorteingles.es"
+- "Clínica Baviera" → canonical: "Baviera Group", domain: "clinicabaviera.com"
+- "Laboratorios Rovi" → canonical: "Rovi Pharmaceuticals", domain: "rovi.es"
+
+Return ONLY a JSON array, one object per company in the same order:
+[{{"company":"","canonical_name":"","domain":"","alt_names":[]}}]"""
+    try:
+        return call_claude(prompt,
+                           "You only respond with structured JSON arrays. Never wrap in markdown code blocks.",
+                           key, max_tokens=2048)
+    except Exception:
+        return [{"company": c, "canonical_name": c, "domain": "", "alt_names": []}
+                for c in company_list]
+
+
+def enrich_org(resolved, key):
+    """Try canonical name, alt names, then original — stop at first Apollo hit."""
+    original  = resolved.get("company", "")
+    canonical = resolved.get("canonical_name") or original
+    alt_names = resolved.get("alt_names") or []
+
+    candidates = []
+    if canonical:
+        candidates.append(canonical)
+    for alt in alt_names:
+        if alt and alt not in candidates:
+            candidates.append(alt)
+    if original and original not in candidates:
+        candidates.append(original)
+
+    for name in candidates:
+        try:
+            data = apollo_post("mixed_companies/search", {
+                "q_organization_name": name,
+                "organization_locations": ["Spain"],
+                "page": 1, "per_page": 1,
+            }, key)
+            orgs = data.get("organizations", [])
+            if orgs:
+                orgs[0]["_resolved_name"] = name
+                return orgs[0]
+        except Exception:
+            continue
+    return None
+
+def search_people(company_name, domain, titles, key, max_results=2):
+    contacts, seen = [], set()
+    try:
+        payload = {"page":1, "per_page":max_results, "person_titles": titles[:5]}
+        if domain:
+            payload["organization_domains"] = [domain]
+        else:
+            payload["q_organization_name"] = company_name
+        data = apollo_post("mixed_people/api_search", payload, key)
+        for p in data.get("people", []):
+            if p.get("id") not in seen:
+                contacts.append(p)
+                seen.add(p["id"])
+    except Exception:
+        pass
+    return contacts[:max_results]
+
+def score_apollo(stage1_score, apollo_org):
+    if not apollo_org:
+        return {"bonus":0, "final_score":stage1_score, "signals":{},
+                "account_type":"Unknown", "technologies":[],
+                "employees":None, "funding_total":None, "funding_date":None,
+                "domain":None, "linkedin":None}
+
+    bonus, signals = 0, {}
+    raw_tech  = apollo_org.get("technology_names") or []
+    tech_low  = {t.lower() for t in raw_tech}
+
+    sf = bool(tech_low & SALESFORCE_KW)
+    comp_crm = bool(tech_low & COMPETITOR_KW)
+
+    if sf:
+        bonus += 8
+        signals["salesforce_in_stack"] = True
+        account_type = "Existing Business"
+    elif comp_crm:
+        bonus += 3
+        signals["competitor_crm"] = True
+        account_type = "Green Field — Displacement"
+    else:
+        signals["salesforce_in_stack"] = False
+        account_type = "Green Field — Transformation"
+
+    # Funding
+    events = apollo_org.get("funding_events") or []
+    latest_date, total_funding = None, None
+    signals["recent_funding"] = False
+    if events:
+        dated = sorted([e for e in events if e.get("date")],
+                       key=lambda e: e["date"], reverse=True)
+        if dated:
+            latest_date = dated[0]["date"]
+            try:
+                dt = datetime.fromisoformat(latest_date.replace("Z","+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                if (datetime.now(timezone.utc)-dt).days/30.44 <= 18:
+                    bonus += 5
+                    signals["recent_funding"] = latest_date
+            except Exception:
+                pass
+        raw_total = apollo_org.get("total_funding")
+        total_funding = int(raw_total) if raw_total else None
+
+    # CRM hiring — from real job postings
+    job_postings = apollo_org.get("job_postings") or []
+    crm_jobs = [j.get("title","") for j in job_postings
+                if any(k in j.get("title","").lower() for k in CRM_HIRING_KW)]
+    if crm_jobs:
+        bonus += 3
+    signals["crm_hiring"]    = bool(crm_jobs)
+    signals["crm_job_titles"] = crm_jobs
+
+    # Headcount
+    emp = apollo_org.get("estimated_num_employees")
+    if emp and emp > 0:
+        bonus += 2
+        signals["headcount_confirmed"] = True
+
+    # Domain
+    domain = (apollo_org.get("primary_domain")
+              or apollo_org.get("website_url","").replace("http://","")
+                 .replace("https://","").split("/")[0])
+
+    return {
+        "bonus": bonus,
+        "final_score": stage1_score + bonus,
+        "signals": signals,
+        "account_type": account_type,
+        "technologies": raw_tech[:10],
+        "employees": emp,
+        "funding_total": total_funding,
+        "funding_date": latest_date,
+        "domain": domain,
+        "linkedin": apollo_org.get("linkedin_url"),
+        "crm_job_titles": crm_jobs,
+    }
+
+def score_to_tier(score):
+    if score >= 35: return "A Strategic"
+    if score >= 25: return "B Prime"
+    if score >= 15: return "C Monitor"
+    return "Low Priority"
+
+def claude_prefilter(company_list, key):
+    block = "\n".join(f"- {c}" for c in company_list)
+    prompt = f"""You are screening companies for a Salesforce enterprise sales team targeting Iberian (Spain and Portugal) accounts.
+
+For each company return "keep" or "discard" based ONLY on these criteria:
+
+DISCARD if ANY of the following apply:
+- Fewer than 600 employees (estimated)
+- No decision-making presence in Spain or Portugal
+- Industry with no CRM/SaaS transformation potential (e.g. public administration, micro-retail, NGO, agriculture)
+- Company name unrecognisable or clearly not an enterprise
+
+KEEP all others.
+
+COMPANIES:
+{block}
+
+Return ONLY a JSON array, one object per company in the same order:
+[{{"company":"","decision":"keep","reason":"","detail":""}}]
+
+For kept companies: reason and detail are empty strings.
+For discarded companies: reason = exact discard criteria phrase above, detail = brief factual context (one sentence)."""
+    try:
+        return call_claude(prompt,
+                           "You only respond with structured JSON arrays. Never wrap in markdown code blocks.",
+                           key, max_tokens=4096)
+    except Exception as e:
+        return [{"company": c, "decision": "keep", "reason": "", "detail": str(e)}
+                for c in company_list]
+
+
+def is_new_hire(person, months=6):
+    """Return (bool, date_str) — True if current role started within `months` months."""
+    history = person.get("employment_history") or []
+    current = next((e for e in history if e.get("current") or not e.get("end_date")), None)
+    if not current:
+        return False, None
+    start = current.get("start_date", "")
+    if not start:
+        return False, None
+    try:
+        parts = start.split("-")
+        dt = datetime(int(parts[0]), int(parts[1]) if len(parts) > 1 else 1,
+                      int(parts[2]) if len(parts) > 2 else 1, tzinfo=timezone.utc)
+        if (datetime.now(timezone.utc) - dt).days / 30.44 <= months:
+            return True, start
+    except Exception:
+        pass
+    return False, None
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# HELPERS — Claude
+# ════════════════════════════════════════════════════════════════════════════════
+def call_claude(prompt, system, key, max_tokens=4096):
+    client = anthropic.Anthropic(api_key=key)
+    msg = client.messages.create(
+        model=CLAUDE_MODEL, max_tokens=max_tokens, temperature=0,
+        system=system,
+        messages=[{"role":"user","content":prompt}]
+    )
+    raw = msg.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+    return json.loads(raw)
+
+def claude_stage1(batch, key):
+    block = "\n".join(f"- {c}" for c in batch)
+    prompt = f"""Analyze these Spanish companies and score each one.
+
+COMPANIES:
+{block}
+
+SCORING RULES (Score 1-50):
+1. Size: 600-1500 (+8), 1500-5000 (+12), 5000+ (+15)
+2. Industry: Consumer Goods (+15), Retail/Omnichannel (+15), Financial Services (+10),
+   Telco (+10), Pharma (+8), Manufacturing (+8), Other (+5)
+3. Spain layer: HQ in Spain (+12), Spain main revenue (+8), Spanish exec committee (+8), Intl HQ (+0)
+4. CRM signals: Salesforce confirmed (+8), Dynamics/SAP CRM (+6), CRM hiring (+8), Commerce Cloud (+6)
+
+TRIGGER EVENTS (note if detected — do NOT add extra points):
+- New CIO/CDO/CCO hired recently
+- Recent funding round
+- Active CRM/digital job postings
+- Competitor CRM confirmed
+
+TIERING: 35+ = A Strategic | 25-34 = B Prime | 15-24 = C Monitor | <15 = Low Priority
+
+Return ONLY a JSON array, one object per company in the same order:
+[{{"company":"","score":0,"tier":"","industry":"","account_type_hint":"Green Field or Existing Business","trigger_events":[],"narrative":""}}]"""
+    try:
+        return call_claude(prompt,
+                           "You only respond with structured JSON arrays. Never wrap in markdown code blocks.",
+                           key)
+    except Exception as e:
+        return [{"company":c,"score":0,"tier":"Low Priority","industry":"Unknown",
+                 "account_type_hint":"Unknown","trigger_events":[],"narrative":str(e)}
+                for c in batch]
+
+def claude_stage3a(accounts, key):
+    block = ""
+    for a in accounts:
+        block += f"""
+Company: {a['company']}
+Industry: {a['industry']}
+Account Type: {a['account_type']}
+Final Score: {a['final_score']}
+Technologies: {', '.join(a.get('technologies',[])[:5]) or 'Unknown'}
+Active CRM Job Postings: {', '.join(a.get('crm_job_titles',[])) or 'None detected'}
+Trigger Events: {', '.join(a.get('trigger_events',[])) or 'None detected'}
+"""
+    prompt = f"""For each account define the ideal buying committee and outreach strategy.
+
+{block}
+
+BUYING COMMITTEE RULES:
+- Hot Lead: C-Level with P&L or transformation ownership, or confirmed CRM decision maker
+- Warm Lead: Director/Manager owning CRM, Digital, Sales Ops, or Ecommerce
+- Cold Lead: Manager/analyst level — intel gathering only
+
+OUTREACH ANGLES by account type:
+- Green Field Transformation: Customer 360 unification, replace spreadsheets/point solutions
+- Green Field Displacement: competitor weaknesses, migration path, better ROI
+- Existing Business: expansion (more clouds, Agentforce, Data Cloud, AI)
+
+Return ONLY a JSON array, one object per company in the same order:
+[{{
+  "company":"",
+  "buying_committee":[
+    {{"persona":"","role_type":"Power Lead or Sponsor Lead","priority":"Hot or Warm or Cold",
+      "search_titles":[],"why":""}}
+  ],
+  "outreach_angle":"",
+  "why_now":"",
+  "value_pillar":""
+}}]"""
+    try:
+        return call_claude(prompt,
+                           "You only respond with structured JSON arrays. Never wrap in markdown code blocks.",
+                           key, max_tokens=8000)
+    except Exception as e:
+        return [{"company":a['company'],"buying_committee":[],"outreach_angle":"",
+                 "why_now":str(e),"value_pillar":""}
+                for a in accounts]
+
+def claude_stage4(leads_data, key):
+    block = ""
+    for item in leads_data:
+        for lead in item.get("hot_leads", []):
+            new_hire_line = f"New Hire: YES — joined {lead['hire_date']} (use 'new broom' angle)" if lead.get("new_hire") else "New Hire: No"
+            block += f"""
+Company: {item['company']} ({item['industry']} · {item['account_type']})
+Lead: {lead.get('name','Unknown')} — {lead.get('title','')}
+{new_hire_line}
+Angle: {item.get('outreach_angle','')}
+Why Now: {item.get('why_now','')}
+Value Pillar: {item.get('value_pillar','')}
+---"""
+    if not block.strip():
+        return []
+    prompt = f"""Generate personalized outreach for each lead.
+
+{block}
+
+For each lead return:
+- email_opener: 2-3 lines personalized to their role and company context (in Spanish or English based on company)
+- why_now_hook: one sentence based on trigger events / account type
+- sequence: LinkedIn connect → email → call cadence suggestion
+
+Return ONLY a JSON array:
+[{{"company":"","lead_name":"","lead_title":"","email_opener":"","why_now_hook":"","sequence":""}}]"""
+    try:
+        return call_claude(prompt,
+                           "You only respond with structured JSON arrays. Never wrap in markdown code blocks.",
+                           key, max_tokens=8000)
+    except Exception:
+        return []
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# HELPERS — HTML export
+# ════════════════════════════════════════════════════════════════════════════════
+def generate_html(s1, s2, s3, s4, today):
+    tier_colors = {"A Strategic":"#16a34a","B Prime":"#2563eb",
+                   "C Monitor":"#d97706","Low Priority":"#6b7280"}
+    type_colors = {"Existing Business":"#7c3aed",
+                   "Green Field — Displacement":"#dc2626",
+                   "Green Field — Transformation":"#0891b2",
+                   "Unknown":"#6b7280"}
+
+    results = s2 if s2 else s1
+    results = sorted(results, key=lambda x: x.get("final_score", x.get("score",0)), reverse=True)
+
+    leads_by_company  = {r["company"]: r for r in s3}
+    outreach_by_lead  = {}
+    for r in s4:
+        outreach_by_lead[f"{r.get('company','')}-{r.get('lead_name','')}"] = r
+
+    rows = ""
+    for r in results:
+        tier   = r.get("final_tier", r.get("tier",""))
+        atype  = r.get("account_type", r.get("account_type_hint",""))
+        score  = r.get("final_score", r.get("score",0))
+        tc     = tier_colors.get(tier,"#6b7280")
+        ac     = type_colors.get(atype,"#6b7280")
+
+        leads_html = ""
+        for lead in leads_by_company.get(r.get("company",""),{}).get("leads",[]):
+            pc = "#dc2626" if lead.get("priority")=="Hot" else "#d97706" if lead.get("priority")=="Warm" else "#6b7280"
+            ln = f' <a href="{lead["linkedin"]}" target="_blank" style="color:#2563eb">LI</a>' if lead.get("linkedin") else ""
+            leads_html += (f'<div style="margin-bottom:3px">'
+                           f'<span style="color:{pc};font-weight:600">{lead.get("priority","")}</span> '
+                           f'{lead.get("name","—")} · '
+                           f'<span style="color:#6b7280;font-size:11px">{lead.get("title","")}</span>'
+                           f'{ln}</div>')
+
+        rows += f"""<tr>
+          <td style="font-weight:600">{r.get('company','')}</td>
+          <td style="text-align:center;color:#6b7280">{r.get('ae_source','')}</td>
+          <td style="text-align:center;font-weight:700;font-size:18px">{score}</td>
+          <td style="text-align:center">
+            <span style="background:{tc};color:white;padding:2px 8px;border-radius:10px;font-size:12px">{tier}</span>
+          </td>
+          <td>
+            <span style="background:{ac};color:white;padding:2px 6px;border-radius:8px;font-size:11px">{atype}</span>
+          </td>
+          <td style="font-size:12px">{r.get('industry','')}</td>
+          <td style="font-size:12px">{leads_html or '—'}</td>
+          <td style="font-size:11px;color:#4b5563">{r.get('narrative','')}</td>
+        </tr>"""
+
+    return f"""<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<title>Hunting Machine — {today}</title>
+<style>
+*{{box-sizing:border-box;margin:0;padding:0}}
+body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f9fafb;padding:32px;color:#111827}}
+h1{{font-size:24px;font-weight:700;color:#1e293b}}
+.meta{{color:#6b7280;font-size:13px;margin:6px 0 24px}}
+table{{width:100%;border-collapse:collapse;background:white;border-radius:10px;
+       overflow:hidden;box-shadow:0 1px 3px rgba(0,0,0,.08)}}
+th{{background:#f8fafc;padding:11px 12px;text-align:left;font-size:11px;color:#6b7280;
+    text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #e5e7eb}}
+td{{padding:12px;border-bottom:1px solid #f1f5f9;vertical-align:top}}
+tr:last-child td{{border-bottom:none}}
+tr:hover td{{background:#f8fafc}}
+</style></head><body>
+<h1>🎯 Hunting Machine</h1>
+<div class="meta">Generated {today} · {len(results)} accounts · Claude Sonnet 4.6 + Apollo.io</div>
+<table>
+<thead><tr>
+  <th>Company</th><th>AE</th><th>Score</th><th>Tier</th>
+  <th>Type</th><th>Industry</th><th>Leads</th><th>Narrative</th>
+</tr></thead>
+<tbody>{rows}</tbody>
+</table></body></html>"""
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# STAGE 0 — Upload + Pre-Filter
+# ════════════════════════════════════════════════════════════════════════════════
+st.markdown("---")
+st.subheader("📂 Step 0 — Upload Account Lists")
+
+uploaded_files = st.file_uploader(
+    "Upload one or more account files (CSV or JSON)",
+    type=["csv","json"],
+    accept_multiple_files=True
+)
+
+if uploaded_files and not st.session_state.prefilter_done:
+    company_sources = {}
+    for f in uploaded_files:
+        src = ae_name.strip() or f.name.rsplit(".",1)[0]
+        pairs = load_companies(f, src)
+        added = sum(1 for c,s in pairs if c not in company_sources
+                    and not company_sources.update({c:s}))  # type: ignore
+        st.caption(f"📄 {f.name} → {added} companies · source: **{src}**")
+
+    all_companies = list(company_sources.keys())
+    st.info(f"**{len(all_companies)} unique companies** loaded. Pre-filter will remove obvious low-potential accounts before Stage 1.")
+
+    if not (anthropic_key and anthropic_key.startswith("sk-ant-")):
+        st.warning("Enter a valid Anthropic API key in the sidebar.")
+    elif st.button("🔍 Run Pre-Filter", type="primary"):
+        with st.spinner(f"Screening {len(all_companies)} companies in one Claude call..."):
+            pf = claude_prefilter(all_companies, anthropic_key)
+        st.session_state.prefilter_results = pf
+        st.session_state.company_sources   = company_sources
+        st.session_state.prefilter_done    = True
+        st.rerun()
+
+# ── Pre-filter results ────────────────────────────────────────────────────────
+if st.session_state.prefilter_done and st.session_state.stage == 0:
+    st.markdown("---")
+    st.subheader("🔍 Pre-Filter Results")
+    st.caption("Review below. Restore any accounts incorrectly discarded before running Stage 1.")
+
+    pf  = st.session_state.prefilter_results
+    cs  = st.session_state.company_sources
+    kept      = [r for r in pf if r.get("decision") == "keep"]
+    discarded = [r for r in pf if r.get("decision") == "discard"]
+    saving    = f"~{int(len(discarded)/len(pf)*100)}%" if pf else "0%"
+
+    mc1, mc2, mc3, mc4 = st.columns(4)
+    mc1.metric("Uploaded",     len(pf))
+    mc2.metric("Proceeding",   len(kept))
+    mc3.metric("Discarded",    len(discarded))
+    mc4.metric("Tokens saved", saving)
+
+    st.markdown(f"**✅ Proceeding to Stage 1 — {len(kept)} accounts**")
+    keep_df = pd.DataFrame([{
+        "Company":   r["company"],
+        "AE":        cs.get(r["company"], ""),
+        "Reasoning": r.get("detail", ""),
+    } for r in kept])
+    st.dataframe(keep_df, use_container_width=True, hide_index=True)
+
+    restored_companies = []
+    if discarded:
+        with st.expander(f"❌ Discarded accounts ({len(discarded)}) — click to review and restore"):
+            st.caption("Check ↩ Restore to add an account back. AE relationship context may override the pre-filter.")
+            discard_df = pd.DataFrame([{
+                "Company":     r["company"],
+                "AE":          cs.get(r["company"], ""),
+                "Reason":      r.get("reason", ""),
+                "Detail":      r.get("detail", ""),
+                "↩ Restore":   False,
+            } for r in discarded])
+            edited_discard = st.data_editor(
+                discard_df,
+                column_config={"↩ Restore": st.column_config.CheckboxColumn("↩ Restore", default=False)},
+                use_container_width=True,
+                hide_index=True,
+                key="restore_editor",
+                disabled=["Company","AE","Reason","Detail"],
+            )
+            restored_companies = edited_discard[edited_discard["↩ Restore"] == True]["Company"].tolist()
+            if restored_companies:
+                st.caption(f"↩ {len(restored_companies)} account(s) will be restored to Stage 1.")
+
+    total_proceeding = len(kept) + len(restored_companies)
+    if st.button(f"🧠 Confirm & Run Stage 1 — Claude Full Scoring ({total_proceeding} accounts)", type="primary"):
+        final_companies = [r["company"] for r in kept] + restored_companies
+        batches  = [final_companies[i:i+BATCH_SIZE] for i in range(0, len(final_companies), BATCH_SIZE)]
+        progress = st.progress(0)
+        status   = st.empty()
+        s1       = []
+        for i, batch in enumerate(batches):
+            status.text(f"🧠 Batch {i+1}/{len(batches)}: {', '.join(batch[:3])}...")
+            results = claude_stage1(batch, anthropic_key)
+            for r in results:
+                r["ae_source"] = st.session_state.company_sources.get(r.get("company",""), "")
+            s1.extend(results)
+            progress.progress((i+1)/len(batches))
+
+        s1.sort(key=lambda x: x.get("score", 0), reverse=True)
+        st.session_state.stage1_results = s1
+        st.session_state.stage          = 1
+        status.success(f"✅ Stage 1 complete — {len(s1)} accounts tiered.")
+        st.rerun()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# STAGE 1 — Review Gate (only when stage == 1)
+# ════════════════════════════════════════════════════════════════════════════════
+if st.session_state.stage == 1 and st.session_state.stage1_results:
+    st.markdown("---")
+    st.subheader("✏️ Step 1 — Manual Review Gate")
+    st.caption(f"Override tiers or mark accounts as 'Remove' before Apollo spend. Recommended: score ≥ {APOLLO_MIN_SCORE} for Apollo enrichment. Accounts scoring 25–27 may return limited data for Iberian companies.")
+
+    s1 = st.session_state.stage1_results
+    review_df = pd.DataFrame([{
+        "Company":        r.get("company",""),
+        "AE":             r.get("ae_source",""),
+        "Score":          int(r.get("score",0)),
+        "Claude Tier":    r.get("tier",""),
+        "Override Tier":  r.get("tier","") if r.get("score",0) >= APOLLO_MIN_SCORE else "C Monitor",
+        "Industry":       r.get("industry",""),
+        "Account Type":   r.get("account_type_hint",""),
+        "Triggers":       ", ".join(r.get("trigger_events",[])),
+        "Narrative":      r.get("narrative",""),
+    } for r in s1])
+
+    show_all = st.checkbox("Show Low Priority accounts", value=False)
+    display_df = review_df if show_all else review_df[review_df["Claude Tier"] != "Low Priority"]
+
+    c1, c2 = st.columns([3,1])
+    with c2:
+        eligible = len(display_df[~display_df["Override Tier"].isin(["Low Priority","Remove"])])
+        st.metric("Proceeding to Apollo", eligible)
+
+    edited_df = st.data_editor(
+        display_df,
+        column_config={
+            "Override Tier": st.column_config.SelectboxColumn(
+                "Override Tier",
+                options=["A Strategic","B Prime","C Monitor","Low Priority","Remove"],
+                required=True,
+            ),
+            "Score":     st.column_config.NumberColumn("Score", format="%d"),
+            "Narrative": st.column_config.TextColumn("Narrative", width="large"),
+            "Triggers":  st.column_config.TextColumn("Triggers", width="medium"),
+        },
+        use_container_width=True,
+        hide_index=True,
+        key="review_editor",
+    )
+
+    # Accounts promoted to A Strategic or B Prime go to Apollo regardless of raw score.
+    # Accounts scoring 25-27 default to C Monitor so they are excluded unless AE promotes them.
+    confirmed = edited_df[edited_df["Override Tier"].isin(["A Strategic", "B Prime"])]
+    below_threshold = edited_df[
+        (edited_df["Score"] >= 25) & (edited_df["Score"] < APOLLO_MIN_SCORE) &
+        ~edited_df["Override Tier"].isin(["A Strategic","B Prime","Low Priority","Remove"])
+    ]
+    st.caption(f"**{len(confirmed)} accounts** will be sent to Apollo.")
+    if len(below_threshold) > 0:
+        st.caption(f"⚠️ {len(below_threshold)} account(s) scoring 25–27 are excluded by default — change their Override Tier to B Prime or A Strategic above to include them.")
+
+    if not apollo_key:
+        st.warning("Enter your Apollo API key in the sidebar to proceed.")
+    elif st.button("🔍 Confirm & Run Apollo — Stage 2", type="primary"):
+        rows     = confirmed.to_dict("records")
+        progress = st.progress(0)
+        status   = st.empty()
+        s2       = []
+        triggers_by_company = {r.get("company",""): r.get("trigger_events",[])
+                                for r in st.session_state.stage1_results}
+
+        # Semantic name resolution — one Claude call for all companies
+        status.text("🧠 Claude resolving company names for Apollo search...")
+        company_names = [row["Company"] for row in rows]
+        resolved_list = claude_resolve_names(company_names, anthropic_key)
+        resolved_map  = {r.get("company",""): r for r in resolved_list}
+
+        for i, row in enumerate(rows):
+            status.text(f"🔍 Apollo enriching {i+1}/{len(rows)}: {row['Company']}...")
+            resolved   = resolved_map.get(row["Company"],
+                             {"company": row["Company"], "canonical_name": row["Company"],
+                              "domain": "", "alt_names": []})
+            apollo_org = enrich_org(resolved, apollo_key)
+            scoring    = score_apollo(row["Score"], apollo_org)
+
+            final_tier = score_to_tier(scoring["final_score"])
+            override   = row["Override Tier"]
+            # Respect manual override if it demotes the account
+            if TIER_ORDER.get(override,99) > TIER_ORDER.get(final_tier,99):
+                final_tier = override
+
+            s2.append({
+                "company":          row["Company"],
+                "ae_source":        row["AE"],
+                "industry":         row["Industry"],
+                "narrative":        row["Narrative"],
+                "stage1_score":     row["Score"],
+                "stage1_tier":      row["Claude Tier"],
+                "override_tier":    override,
+                "apollo_bonus":     scoring["bonus"],
+                "final_score":      scoring["final_score"],
+                "final_tier":       final_tier,
+                "account_type":     scoring["account_type"],
+                "sig_salesforce":   scoring["signals"].get("salesforce_in_stack", False),
+                "sig_funding":      bool(scoring["signals"].get("recent_funding", False)),
+                "sig_crm_hiring":   scoring["signals"].get("crm_hiring", False),
+                "crm_job_titles":   scoring["crm_job_titles"],
+                "technologies":     scoring["technologies"],
+                "employees":        scoring["employees"],
+                "funding_total":    scoring["funding_total"],
+                "domain":           scoring["domain"] or resolved.get("domain",""),
+                "linkedin":         scoring["linkedin"],
+                "trigger_events":   triggers_by_company.get(row["Company"], []),
+                "apollo_name_used": apollo_org.get("_resolved_name","") if apollo_org else "",
+                "apollo_canonical": resolved.get("canonical_name",""),
+            })
+            progress.progress((i+1)/len(rows))
+
+        s2.sort(key=lambda x: x.get("final_score",0), reverse=True)
+        st.session_state.stage2_results = s2
+        st.session_state.stage          = 2
+        status.success(f"✅ Stage 2 complete — {len(s2)} accounts enriched.")
+        st.rerun()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# STAGE 2 — Apollo Results
+# ════════════════════════════════════════════════════════════════════════════════
+if st.session_state.stage >= 2 and st.session_state.stage2_results:
+    st.markdown("---")
+    st.subheader("🔍 Stage 2 — Apollo Enrichment")
+    st.caption(
+        "**S1 Score** = Claude first tiering · "
+        "**Apollo +** = bonus from real Apollo signals · "
+        "**Final Score** = S1 + Apollo · Sorted by final score descending"
+    )
+
+    s2 = st.session_state.stage2_results
+
+    # ── Metrics ───────────────────────────────────────────────────────────────
+    tier_a    = [r for r in s2 if r["final_tier"] == "A Strategic"]
+    tier_b    = [r for r in s2 if r["final_tier"] == "B Prime"]
+    promoted  = [r for r in s2 if r["final_tier"] != r["stage1_tier"]]
+    eb        = [r for r in s2 if "Existing" in r.get("account_type","")]
+    gf        = [r for r in s2 if "Green Field" in r.get("account_type","")]
+    no_apollo = [r for r in s2 if r.get("apollo_bonus",0) == 0 and not r.get("sig_salesforce")]
+    resolved_hit = [r for r in s2 if r.get("apollo_name_used") and
+                    r["apollo_name_used"] != r["company"]]
+    hit_rate  = int((len(s2) - len(no_apollo)) / len(s2) * 100) if s2 else 0
+    avg_bonus = round(sum(r.get("apollo_bonus",0) for r in s2) / len(s2), 1) if s2 else 0
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Enriched",       len(s2))
+    c2.metric("A Strategic",    len(tier_a), delta=f"+{len(promoted)} promoted by Apollo" if promoted else None)
+    c3.metric("B Prime",        len(tier_b))
+    c4.metric("Apollo Hit Rate",f"{hit_rate}%",
+              delta=f"↑ name resolution: {len(resolved_hit)} via canonical/alt" if resolved_hit else None)
+
+    c5, c6, c7, c8 = st.columns(4)
+    c5.metric("Existing Business", len(eb))
+    c6.metric("Green Field",       len(gf))
+    c7.metric("No Apollo Data",    len(no_apollo))
+    c8.metric("Avg Apollo Bonus",  f"+{avg_bonus}")
+
+    # ── Name resolution summary ────────────────────────────────────────────────
+    canon_fixed = [r for r in s2 if r.get("apollo_canonical") and
+                   r.get("apollo_name_used") == r.get("apollo_canonical") and
+                   r["apollo_canonical"] != r["company"]]
+    alt_fixed   = [r for r in s2 if r.get("apollo_name_used") and
+                   r["apollo_name_used"] != r.get("apollo_canonical","") and
+                   r["apollo_name_used"] != r["company"]]
+
+    if resolved_hit:
+        parts = []
+        if canon_fixed:
+            parts.append(f"{len(canon_fixed)} found via canonical name "
+                         f"({', '.join(r['company'] for r in canon_fixed[:2])})")
+        if alt_fixed:
+            parts.append(f"{len(alt_fixed)} found via alt name "
+                         f"({', '.join(r['company'] for r in alt_fixed[:2])})")
+        st.success(f"🧠 **Name resolution:** Claude resolved all company names in 1 API call. "
+                   + " · ".join(parts) + f" · Apollo hit rate: **{hit_rate}%**")
+
+    # ── Name resolution expander ───────────────────────────────────────────────
+    resolved_rows = [r for r in s2 if r.get("apollo_canonical")]
+    if resolved_rows:
+        with st.expander(f"🔤 Claude Name Resolution — {len(resolved_rows)} companies"):
+            res_html = """
+<style>
+.rt { width:100%; border-collapse:collapse; font-size:12px; font-family:-apple-system,sans-serif; }
+.rt th { color:#9ca3af; font-weight:600; text-transform:uppercase; font-size:10px;
+         letter-spacing:.05em; padding:0 12px 8px 0; text-align:left;
+         border-bottom:1px solid #f1f5f9; }
+.rt td { padding:7px 12px 7px 0; border-bottom:1px solid #f8fafc; vertical-align:middle; }
+.rt tr:last-child td { border-bottom:none; }
+.ae   { color:#6b7280; }
+.cn   { font-weight:600; color:#111827; }
+.dtag { background:#f1f5f9; color:#6b7280; font-size:10px; padding:1px 7px;
+        border-radius:6px; margin-left:4px; }
+.atag { background:#fef9c3; color:#92400e; font-size:10px; padding:1px 7px;
+        border-radius:6px; margin-left:4px; }
+.mb   { font-size:10px; font-weight:600; padding:2px 8px; border-radius:10px; }
+.mc   { background:#dcfce7; color:#16a34a; }
+.ma   { background:#fef9c3; color:#92400e; }
+.mo   { background:#f1f5f9; color:#6b7280; }
+.mn   { background:#fee2e2; color:#dc2626; }
+</style>
+<table class="rt">
+<thead><tr>
+  <th>AE Upload Name</th><th>Canonical (Apollo)</th>
+  <th>Domain</th><th>Alt Names</th><th>Matched On</th>
+</tr></thead><tbody>"""
+            for r in resolved_rows:
+                ae_name_val = r["company"]
+                canon       = r.get("apollo_canonical","")
+                domain      = r.get("domain","")
+                matched_on  = r.get("apollo_name_used","")
+                if matched_on == canon and matched_on != ae_name_val:
+                    m_cls, m_txt = "mc", "canonical"
+                elif matched_on and matched_on != canon and matched_on != ae_name_val:
+                    m_cls, m_txt = "ma", "alt name"
+                elif matched_on == ae_name_val:
+                    m_cls, m_txt = "mo", "original"
+                else:
+                    m_cls, m_txt = "mn", "no match"
+                domain_tag = f'<span class="dtag">{domain}</span>' if domain else "—"
+                row_bg = ' style="background:#f0fdf4"' if m_cls=="mc" and canon!=ae_name_val else \
+                         ' style="background:#fffbeb"' if m_cls=="ma" else ""
+                res_html += f"""<tr{row_bg}>
+  <td class="ae">{ae_name_val}</td>
+  <td class="cn">{canon}</td>
+  <td>{domain_tag}</td>
+  <td>—</td>
+  <td><span class="mb {m_cls}">{m_txt}</span></td>
+</tr>"""
+            res_html += "</tbody></table>"
+            st.markdown(res_html, unsafe_allow_html=True)
+
+    # ── Main results table ─────────────────────────────────────────────────────
+    def _tier_badge(tier):
+        cls = "ta" if tier == "A Strategic" else "tb" if tier == "B Prime" else "tc"
+        return f'<span class="tbadge {cls}">{tier}</span>'
+
+    def _type_badge(atype):
+        if "Existing" in atype:   cls = "teb"
+        elif "Displacement" in atype: cls = "tgfd"
+        else:                     cls = "tgft"
+        return f'<span class="typbadge {cls}">{atype}</span>'
+
+    def _signals_html(r):
+        pills = []
+        if r.get("sig_salesforce"):     pills.append('<span class="sig sig-sf">✓ Salesforce +8</span>')
+        if r.get("account_type","").count("Displacement"): pills.append('<span class="sig sig-comp">⚡ Competitor CRM +3</span>')
+        if r.get("sig_funding"):        pills.append('<span class="sig sig-fund">💰 Funding +5</span>')
+        if r.get("sig_crm_hiring"):     pills.append('<span class="sig sig-jobs">📋 CRM Jobs +3</span>')
+        if r.get("employees"):          pills.append('<span class="sig sig-head">✓ Headcount +2</span>')
+        return " ".join(pills) if pills else '<span class="sig sig-none">No Apollo signals</span>'
+
+    tbl_html = """
+<style>
+.s2t { width:100%; border-collapse:collapse; background:white; border-radius:8px;
+       overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,.07); font-family:-apple-system,sans-serif; }
+.s2t th { background:#f8fafc; padding:10px 12px; text-align:left; font-size:10px;
+          color:#6b7280; text-transform:uppercase; letter-spacing:.04em;
+          border-bottom:1px solid #e5e7eb; white-space:nowrap; }
+.s2t td { padding:10px 12px; border-bottom:1px solid #f1f5f9; font-size:13px; vertical-align:middle; }
+.s2t tr:last-child td { border-bottom:none; }
+.s2t tr.promoted td { background:#fffbeb; }
+.s2t tr.resolved td { background:#f0fdf4; }
+.s1sc { font-size:15px; font-weight:700; text-align:center; color:#9ca3af; }
+.apcol { text-align:center; }
+.bpos { font-size:15px; font-weight:800; color:#16a34a; }
+.bzero { font-size:15px; font-weight:700; color:#d1d5db; }
+.bsub { font-size:10px; color:#9ca3af; margin-top:2px; }
+.fsc { font-size:17px; font-weight:800; text-align:center; }
+.fsa { color:#16a34a; } .fsb { color:#2563eb; } .fsc2 { color:#d97706; }
+.tbadge { display:inline-block; padding:2px 9px; border-radius:10px;
+          font-size:11px; font-weight:600; white-space:nowrap; }
+.ta { background:#dcfce7; color:#16a34a; } .tb { background:#dbeafe; color:#2563eb; }
+.tc { background:#fef3c7; color:#92400e; }
+.ptag { display:inline-block; background:#fef3c7; color:#92400e; border:1px solid #fcd34d;
+        border-radius:4px; font-size:9px; font-weight:700; padding:1px 5px; margin-left:4px; }
+.typbadge { display:inline-block; padding:2px 7px; border-radius:7px;
+            font-size:10px; font-weight:600; white-space:nowrap; }
+.teb { background:#f3e8ff; color:#7c3aed; }
+.tgfd { background:#fee2e2; color:#dc2626; }
+.tgft { background:#e0f2fe; color:#0369a1; }
+.sig { display:inline-flex; align-items:center; padding:2px 7px; border-radius:6px;
+       font-size:10px; font-weight:600; margin:1px; white-space:nowrap; }
+.sig-sf   { background:#f0fdf4; color:#16a34a; border:1px solid #86efac; }
+.sig-fund { background:#eff6ff; color:#2563eb; border:1px solid #93c5fd; }
+.sig-jobs { background:#fff7ed; color:#c2410c; border:1px solid #fed7aa; }
+.sig-head { background:#f8fafc; color:#6b7280; border:1px solid #e2e8f0; }
+.sig-comp { background:#fee2e2; color:#dc2626; border:1px solid #fca5a5; }
+.sig-none { background:#f8fafc; color:#9ca3af; border:1px solid #e5e7eb; font-style:italic; }
+.filetag  { font-size:11px; background:#f1f5f9; color:#6b7280; padding:1px 7px; border-radius:8px; }
+.techlist { font-size:10px; color:#6b7280; line-height:1.7; }
+.rhint    { font-size:10px; color:#16a34a; margin-top:2px; }
+.rhinta   { font-size:10px; color:#d97706; margin-top:2px; }
+</style>
+<table class="s2t">
+<thead><tr>
+  <th>Company</th><th>AE</th>
+  <th style="text-align:center">S1 Score<br><span style="font-size:9px;font-weight:400;text-transform:none">(Claude)</span></th>
+  <th style="text-align:center">Apollo +<br><span style="font-size:9px;font-weight:400;text-transform:none">(bonus)</span></th>
+  <th style="text-align:center">Final Score</th>
+  <th>Final Tier</th><th>Account Type</th>
+  <th>Apollo Signals</th><th>Employees</th><th>Top Technologies</th>
+</tr></thead><tbody>"""
+
+    for r in s2:
+        was_promoted = r["final_tier"] != r["stage1_tier"]
+        resolved_via_canon = (r.get("apollo_canonical") and
+                              r.get("apollo_name_used") == r.get("apollo_canonical") and
+                              r["apollo_canonical"] != r["company"])
+        resolved_via_alt   = (r.get("apollo_name_used") and
+                              r["apollo_name_used"] != r.get("apollo_canonical","") and
+                              r["apollo_name_used"] != r["company"])
+
+        if resolved_via_canon:
+            row_cls = "resolved"
+        elif was_promoted:
+            row_cls = "promoted"
+        else:
+            row_cls = ""
+
+        # Company cell
+        resolve_hint = ""
+        if resolved_via_canon:
+            resolve_hint = f'<div class="rhint">✓ Resolved → {r["apollo_canonical"]}</div>'
+        elif resolved_via_alt:
+            resolve_hint = f'<div class="rhinta">Resolved via alt → {r["apollo_name_used"]}</div>'
+
+        # Scores
+        s1    = r["stage1_score"]
+        bonus = r.get("apollo_bonus", 0)
+        final = r["final_score"]
+        tier  = r["final_tier"]
+
+        fs_cls = "fsa" if tier == "A Strategic" else "fsb" if tier == "B Prime" else "fsc2"
+
+        # Bonus breakdown
+        bonus_parts = []
+        if r.get("sig_salesforce"):     bonus_parts.append("SF +8")
+        if "Displacement" in r.get("account_type","") and not r.get("sig_salesforce"):
+                                        bonus_parts.append("Comp +3")
+        if r.get("sig_funding"):        bonus_parts.append("Fund +5")
+        if r.get("sig_crm_hiring"):     bonus_parts.append("Jobs +3")
+        if r.get("employees"):          bonus_parts.append("Head +2")
+        bonus_sub = " · ".join(bonus_parts)
+
+        promoted_tag = '<span class="ptag">⬆ Promoted</span>' if was_promoted else ""
+        emp_str = f"~{r['employees']:,}" if r.get("employees") else "—"
+        tech_str = " · ".join(r.get("technologies",[])[:5]) or "—"
+
+        tbl_html += f"""<tr class="{row_cls}">
+  <td><strong>{r['company']}</strong>{resolve_hint}</td>
+  <td><span class="filetag">{r['ae_source']}</span></td>
+  <td class="s1sc">{s1}</td>
+  <td class="apcol">
+    <div class="{'bpos' if bonus > 0 else 'bzero'}">{'+' if bonus > 0 else ''}{bonus}</div>
+    <div class="bsub">{bonus_sub}</div>
+  </td>
+  <td class="fsc {fs_cls}">{final}</td>
+  <td>{_tier_badge(tier)}{promoted_tag}</td>
+  <td>{_type_badge(r.get('account_type',''))}</td>
+  <td>{_signals_html(r)}</td>
+  <td style="text-align:center;color:#6b7280;font-size:12px">{emp_str}</td>
+  <td class="techlist">{tech_str}</td>
+</tr>"""
+
+    tbl_html += "</tbody></table>"
+    st.markdown(tbl_html, unsafe_allow_html=True)
+    st.markdown("")  # spacing
+
+    # ── Summary callouts ───────────────────────────────────────────────────────
+    if promoted:
+        names = " · ".join(r["company"] for r in promoted[:3])
+        st.warning(f"⬆ **{len(promoted)} account(s) promoted by Apollo:** {names}")
+
+    st.info(f"👥 **Ready for Lead Intelligence** — "
+            f"**{len(tier_a)} Tier A Strategic accounts** proceed to Stage 3a + 3b.")
+
+    if st.session_state.stage == 2:
+        if not tier_a:
+            st.error("No Tier A Strategic accounts found. Review overrides above.")
+
+        # ── Step 1: Define Buying Committees (3a) ─────────────────────────────
+        elif not st.session_state.stage3a_results:
+            st.markdown("")
+            if not anthropic_key:
+                st.warning("Enter your Anthropic API key in the sidebar to proceed.")
+            elif st.button("🧠 Define Buying Committees — Stage 3a", type="primary"):
+                progress = st.progress(0)
+                status   = st.empty()
+                status.text("🧠 Claude defining buying committees...")
+                batches  = [tier_a[i:i+BATCH_SIZE] for i in range(0, len(tier_a), BATCH_SIZE)]
+                personas = []
+                for i, batch in enumerate(batches):
+                    personas.extend(claude_stage3a(batch, anthropic_key))
+                    progress.progress((i+1)/len(batches))
+                st.session_state.stage3a_results = {p["company"]: p for p in personas}
+                status.success(f"✅ Buying committees defined for {len(personas)} accounts.")
+                st.rerun()
+
+        # ── Step 2: Review gate + Run People Search (3b) ──────────────────────
+        else:
+            personas_map = st.session_state.stage3a_results
+
+            st.markdown("---")
+            st.subheader("🧠 Stage 3a — Buying Committee Review")
+            st.caption("Review the buying committees Claude defined before Apollo people search runs. "
+                       "Expand any account to see personas, outreach angle, and why-now context.")
+
+            # Metrics
+            all_personas   = [p for pd in personas_map.values()
+                               for p in pd.get("buying_committee", [])]
+            hot_personas   = [p for p in all_personas if p.get("priority") == "Hot"]
+            nh_accounts    = [c for c, pd in personas_map.items()
+                              if any(te for te in st.session_state.stage3a_results.get(c,{})
+                                     .get("buying_committee",[]))]
+            total_personas = len(all_personas)
+            apollo_est     = total_personas  # 1 call per persona
+
+            mc1, mc2, mc3, mc4 = st.columns(4)
+            mc1.metric("Accounts",        len(tier_a))
+            mc2.metric("Hot Personas",    len(hot_personas))
+            mc3.metric("Total Personas",  total_personas)
+            mc4.metric("Apollo Calls Est.", apollo_est)
+
+            # Per-account expanders
+            priority_icon = {"Hot": "🔴", "Warm": "🟡", "Cold": "🟢"}
+            role_colors   = {"Power Lead": "#b91c1c", "Sponsor Lead": "#1d4ed8"}
+
+            for account in tier_a:
+                p_data    = personas_map.get(account["company"], {})
+                committee = p_data.get("buying_committee", [])
+                hot_count = sum(1 for p in committee if p.get("priority") == "Hot")
+                nh_flag   = any(te for te in account.get("trigger_events", [])
+                                if "hire" in te.lower() or "cio" in te.lower()
+                                or "cdo" in te.lower() or "cco" in te.lower())
+
+                header = (f"{'🟢' if account['final_tier']=='A Strategic' else '🔵'} "
+                          f"**{account['company']}** · Score {account['final_score']} · "
+                          f"{len(committee)} personas"
+                          + (f" · 🔴 {hot_count} Hot" if hot_count else "")
+                          + (" · 🆕 trigger" if nh_flag else ""))
+
+                with st.expander(header):
+                    col_intel, col_personas = st.columns([1, 2])
+
+                    with col_intel:
+                        st.markdown(f"""
+**Tier:** {account.get('final_tier','')}
+**Industry:** {account.get('industry','')}
+**Account Type:** {account.get('account_type','')}
+**Angle:** {p_data.get('outreach_angle','')}
+**Why Now:** {p_data.get('why_now','')}
+**Value Pillar:** {p_data.get('value_pillar','')}
+""")
+                    with col_personas:
+                        if committee:
+                            cards_html = ""
+                            for p in committee:
+                                pri   = p.get("priority", "Warm")
+                                icon  = priority_icon.get(pri, "🟡")
+                                role  = p.get("role_type", "")
+                                rc    = role_colors.get(role, "#6b7280")
+                                titles_html = "".join(
+                                    f'<span style="font-size:10px;background:#f1f5f9;color:#6b7280;'
+                                    f'padding:1px 6px;border-radius:4px;margin:1px;'
+                                    f'display:inline-block">{t}</span>'
+                                    for t in p.get("search_titles", [])
+                                )
+                                bg = "#fff9f9" if pri=="Hot" else "#fffdf5" if pri=="Warm" else "#f9fafb"
+                                bc = "#fecaca" if pri=="Hot" else "#fde68a" if pri=="Warm" else "#f1f5f9"
+                                cards_html += f"""
+<div style="border:1px solid {bc};background:{bg};border-radius:8px;
+            padding:9px 12px;margin-bottom:7px">
+  <div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">
+    <span style="font-size:14px">{icon}</span>
+    <span style="font-weight:700;font-size:13px;color:#111827">{p.get('persona','')}</span>
+    <span style="font-size:9px;font-weight:700;padding:1px 6px;border-radius:6px;
+                 background:{rc}22;color:{rc}">{role}</span>
+  </div>
+  <div style="font-size:12px;color:#374151;margin-bottom:5px">{p.get('why','')}</div>
+  <div style="display:flex;flex-wrap:wrap;gap:3px">{titles_html}</div>
+</div>"""
+                            st.markdown(cards_html, unsafe_allow_html=True)
+                        else:
+                            st.caption("No committee defined.")
+
+            # Run 3b button
+            st.markdown("")
+            if not apollo_key:
+                st.warning("Enter your Apollo API key in the sidebar to run people search.")
+            elif st.button("👥 Run People Search — Stage 3b", type="primary"):
+                progress = st.progress(0)
+                status   = st.empty()
+                s3       = []
+
+                for i, account in enumerate(tier_a):
+                    status.text(f"👥 Apollo finding leads {i+1}/{len(tier_a)}: {account['company']}...")
+                    p_data    = personas_map.get(account["company"], {})
+                    committee = p_data.get("buying_committee", [])
+                    all_leads, seen_names = [], set()
+
+                    for persona in committee:
+                        titles = persona.get("search_titles", [])
+                        if not titles:
+                            continue
+                        people = search_people(
+                            account["company"], account.get("domain",""),
+                            titles, apollo_key, max_results=2
+                        )
+                        for person in people:
+                            name = person.get("name","")
+                            if name and name not in seen_names:
+                                new_hire, hire_date = is_new_hire(person)
+                                all_leads.append({
+                                    "name":         name,
+                                    "title":        person.get("title",""),
+                                    "email":        person.get("email",""),
+                                    "email_status": person.get("email_status",""),
+                                    "linkedin":     person.get("linkedin_url",""),
+                                    "seniority":    person.get("seniority",""),
+                                    "priority":     persona.get("priority","Warm"),
+                                    "role_type":    persona.get("role_type",""),
+                                    "new_hire":     new_hire,
+                                    "hire_date":    hire_date or "",
+                                })
+                                seen_names.add(name)
+
+                    all_leads.sort(key=lambda l: {"Hot":0,"Warm":1,"Cold":2}.get(l.get("priority","Cold"),2))
+
+                    s3.append({
+                        **account,
+                        "buying_committee": committee,
+                        "outreach_angle":   p_data.get("outreach_angle",""),
+                        "why_now":          p_data.get("why_now",""),
+                        "value_pillar":     p_data.get("value_pillar",""),
+                        "leads":            all_leads,
+                    })
+                    progress.progress((i+1)/len(tier_a))
+
+                s3.sort(key=lambda x: x.get("final_score",0), reverse=True)
+                st.session_state.stage3_results = s3
+                st.session_state.stage          = 3
+                total_leads = sum(len(r["leads"]) for r in s3)
+                status.success(f"✅ Lead intelligence complete — {total_leads} leads found across {len(s3)} accounts.")
+                st.rerun()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# STAGE 3 — Lead Intelligence Results
+# ════════════════════════════════════════════════════════════════════════════════
+if st.session_state.stage >= 3 and st.session_state.stage3_results:
+    st.markdown("---")
+    st.subheader("👥 Stage 3 — Lead Intelligence")
+
+    s3 = st.session_state.stage3_results
+    tier_icon = {"A Strategic":"🟢","B Prime":"🔵","C Monitor":"🟡"}
+
+    for r in s3:
+        icon = tier_icon.get(r.get("final_tier",""),"⚪")
+        with st.expander(f"{icon} **{r['company']}** · Score {r['final_score']} · {r['account_type']}"):
+            c1, c2 = st.columns([1,2])
+            with c1:
+                st.markdown(f"""
+**Tier:** {r.get('final_tier','')}
+**Industry:** {r.get('industry','')}
+**Angle:** {r.get('outreach_angle','')}
+**Why Now:** {r.get('why_now','')}
+**Value Pillar:** {r.get('value_pillar','')}
+""")
+            with c2:
+                leads = r.get("leads",[])
+                if leads:
+                    for lead in leads:
+                        p_icon = "🔴" if lead.get("priority")=="Hot" else "🟡" if lead.get("priority")=="Warm" else "🟢"
+                        ln = f" [LinkedIn]({lead['linkedin']})" if lead.get("linkedin") else ""
+                        em = f" `{lead['email']}`" if lead.get("email") else ""
+                        new_badge = f" 🆕 *hired {lead['hire_date']}*" if lead.get("new_hire") else ""
+                        st.markdown(f"{p_icon} **{lead.get('name','—')}** · {lead.get('title','')}{new_badge}{em}{ln}")
+                else:
+                    st.caption("No leads found via Apollo.")
+
+    if st.session_state.stage == 3:
+        if st.button("✉️ Generate Outreach Intelligence — Stage 4", type="primary"):
+            progress  = st.progress(0)
+            status    = st.empty()
+            leads_data = [{
+                "company":        r["company"],
+                "industry":       r["industry"],
+                "account_type":   r["account_type"],
+                "outreach_angle": r.get("outreach_angle",""),
+                "why_now":        r.get("why_now",""),
+                "value_pillar":   r.get("value_pillar",""),
+                "hot_leads":      [l for l in r.get("leads",[]) if l.get("priority")=="Hot"],
+            } for r in s3]
+
+            status.text("✉️ Claude generating personalized outreach...")
+            batches = [leads_data[i:i+BATCH_SIZE] for i in range(0,len(leads_data),BATCH_SIZE)]
+            s4 = []
+            for i, batch in enumerate(batches):
+                s4.extend(claude_stage4(batch, anthropic_key))
+                progress.progress((i+1)/len(batches))
+
+            st.session_state.stage4_results = s4
+            st.session_state.stage          = 4
+            status.success(f"✅ Outreach intelligence complete — {len(s4)} sequences generated.")
+            st.rerun()
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# STAGE 4 — Outreach + Downloads
+# ════════════════════════════════════════════════════════════════════════════════
+if st.session_state.stage >= 4:
+    st.markdown("---")
+    st.subheader("✉️ Stage 4 — Outreach Intelligence")
+
+    s4 = st.session_state.stage4_results
+    if s4:
+        for r in s4:
+            with st.expander(f"✉️ **{r.get('lead_name','?')}** at {r.get('company','?')} — {r.get('lead_title','')}"):
+                st.markdown(f"**Opening:**\n\n{r.get('email_opener','')}")
+                st.markdown(f"**Why Now:** {r.get('why_now_hook','')}")
+                st.markdown(f"**Sequence:** {r.get('sequence','')}")
+    else:
+        st.info("No Hot leads found — outreach sequences require at least one Hot lead per account.")
+
+    # ── Downloads ──────────────────────────────────────────────────────────────
+    st.markdown("---")
+    st.subheader("📥 Download Results")
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    s1 = st.session_state.stage1_results
+    s2 = st.session_state.stage2_results
+    s3 = st.session_state.stage3_results
+
+    col_xl, col_json, col_html = st.columns(3)
+
+    with col_xl:
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+            # Accounts — sorted by final score
+            acc = sorted(s2 if s2 else s1,
+                         key=lambda x: x.get("final_score", x.get("score",0)), reverse=True)
+            pd.DataFrame(acc).to_excel(writer, sheet_name="Accounts", index=False)
+            # Leads
+            if s3:
+                lead_rows = []
+                for r in sorted(s3, key=lambda x: x.get("final_score",0), reverse=True):
+                    for lead in r.get("leads",[]):
+                        lead_rows.append({"Company":r["company"],
+                                          "Final Score":r.get("final_score",0), **lead})
+                pd.DataFrame(lead_rows).to_excel(writer, sheet_name="Leads", index=False)
+            # Outreach
+            if s4:
+                pd.DataFrame(s4).to_excel(writer, sheet_name="Outreach", index=False)
+        st.download_button("📥 Excel (3 sheets)", data=buf.getvalue(),
+                           file_name=f"hunting_machine_{today}.xlsx")
+
+    with col_json:
+        export = {
+            "generated": today,
+            "accounts": sorted(s2 if s2 else s1,
+                               key=lambda x: x.get("final_score", x.get("score",0)), reverse=True),
+            "leads":    sorted(s3, key=lambda x: x.get("final_score",0), reverse=True) if s3 else [],
+            "outreach": s4,
+        }
+        st.download_button("📥 JSON",
+                           data=json.dumps(export, ensure_ascii=False, indent=2).encode(),
+                           file_name=f"hunting_machine_{today}.json",
+                           mime="application/json")
+
+    with col_html:
+        html = generate_html(s1, s2, s3, s4, today)
+        st.download_button("📥 HTML",
+                           data=html.encode(),
+                           file_name=f"hunting_machine_{today}.html",
+                           mime="text/html")
+
+    st.markdown("---")
+    if st.button("🔄 Start New Run", type="secondary"):
+        for k, default in [
+            ("stage",0), ("prefilter_done",False), ("prefilter_results",[]),
+            ("company_sources",{}), ("stage1_results",[]), ("stage2_results",[]),
+            ("stage3a_results",{}), ("stage3_results",[]), ("stage4_results",[]),
+        ]:
+            st.session_state[k] = default
+        st.rerun()
