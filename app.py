@@ -10,13 +10,21 @@ import io
 import time
 import requests
 import anthropic
-from datetime import datetime, timezone
+import os
+from datetime import datetime, timezone, timedelta
+from dotenv import load_dotenv
+
+load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 CLAUDE_MODEL        = "claude-sonnet-4-6"
 BATCH_SIZE          = 10
 APOLLO_MIN_SCORE    = 28
-APOLLO_DELAY    = 0.6
+APOLLO_DELAY        = 0.6
+CACHE_TTL_DAYS      = 7
+CACHE_FILE          = os.path.join(os.path.dirname(__file__), "stage1_cache.json")
+CACHE_FILE_S2       = os.path.join(os.path.dirname(__file__), "stage2_cache.json")
+CACHE_FILE_PF       = os.path.join(os.path.dirname(__file__), "prefilter_cache.json")
 
 SALESFORCE_KW   = {"salesforce","sales cloud","service cloud","marketing cloud",
                    "commerce cloud","data cloud","pardot","tableau","mulesoft",
@@ -26,15 +34,119 @@ CRM_HIRING_KW   = {"salesforce","crm","sales cloud","service cloud",
                    "marketing cloud","data cloud","agentforce"}
 TIER_ORDER      = {"A Strategic":0,"B Prime":1,"C Monitor":2,"Low Priority":3,"Remove":4}
 
+# ── Stage 1 cache ─────────────────────────────────────────────────────────────
+def _cache_key(company: str) -> str:
+    return company.strip().lower()
+
+def load_stage1_cache() -> dict:
+    """Load cache file, drop expired entries, return valid entries keyed by company."""
+    if not os.path.exists(CACHE_FILE):
+        return {}
+    try:
+        with open(CACHE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=CACHE_TTL_DAYS)
+        valid = {}
+        for k, v in raw.items():
+            try:
+                cached_at = datetime.fromisoformat(v["cached_at"])
+                if cached_at.tzinfo is None:
+                    cached_at = cached_at.replace(tzinfo=timezone.utc)
+                if cached_at >= cutoff:
+                    valid[k] = v
+            except Exception:
+                pass
+        return valid
+    except Exception:
+        return {}
+
+def save_stage1_cache(cache: dict):
+    """Write cache dict to disk."""
+    try:
+        with open(CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def cache_days_remaining(entry: dict) -> int:
+    try:
+        cached_at = datetime.fromisoformat(entry["cached_at"])
+        if cached_at.tzinfo is None:
+            cached_at = cached_at.replace(tzinfo=timezone.utc)
+        expires = cached_at + timedelta(days=CACHE_TTL_DAYS)
+        remaining = (expires - datetime.now(timezone.utc)).days
+        return max(remaining, 0)
+    except Exception:
+        return 0
+
+# ── Stage 2 cache ─────────────────────────────────────────────────────────────
+def load_stage2_cache() -> dict:
+    if not os.path.exists(CACHE_FILE_S2):
+        return {}
+    try:
+        with open(CACHE_FILE_S2, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=CACHE_TTL_DAYS)
+        valid = {}
+        for k, v in raw.items():
+            try:
+                cached_at = datetime.fromisoformat(v["cached_at"])
+                if cached_at.tzinfo is None:
+                    cached_at = cached_at.replace(tzinfo=timezone.utc)
+                if cached_at >= cutoff:
+                    valid[k] = v
+            except Exception:
+                pass
+        return valid
+    except Exception:
+        return {}
+
+def save_stage2_cache(cache: dict):
+    try:
+        with open(CACHE_FILE_S2, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+# ── Pre-filter cache ──────────────────────────────────────────────────────────
+def load_prefilter_cache() -> dict:
+    if not os.path.exists(CACHE_FILE_PF):
+        return {}
+    try:
+        with open(CACHE_FILE_PF, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=CACHE_TTL_DAYS)
+        valid = {}
+        for k, v in raw.items():
+            try:
+                cached_at = datetime.fromisoformat(v["cached_at"])
+                if cached_at.tzinfo is None:
+                    cached_at = cached_at.replace(tzinfo=timezone.utc)
+                if cached_at >= cutoff:
+                    valid[k] = v
+            except Exception:
+                pass
+        return valid
+    except Exception:
+        return {}
+
+def save_prefilter_cache(cache: dict):
+    try:
+        with open(CACHE_FILE_PF, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 # ── Page setup ────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Hunting Machine", page_icon="🎯", layout="wide")
 st.title("🎯 Hunting Machine")
 st.markdown("4-stage account intelligence · **Claude Sonnet 4.6** + **Apollo.io**")
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
+anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
+apollo_key    = os.getenv("APOLLO_API_KEY", "")
+
 st.sidebar.title("⚙️ Configuration")
-anthropic_key = st.sidebar.text_input("Anthropic API Key", type="password")
-apollo_key    = st.sidebar.text_input("Apollo API Key", type="password")
 ae_name       = st.sidebar.text_input("AE Name (source tag)", placeholder="e.g. Alvaro")
 st.sidebar.markdown("---")
 st.sidebar.markdown("""
@@ -60,6 +172,8 @@ for k, default in [
     ("stage3a_results",  {}),
     ("stage3_results",   []),
     ("stage4_results",   []),
+    ("s2_run_credits",   0),
+    ("s3_run_credits",   0),
 ]:
     if k not in st.session_state:
         st.session_state[k] = default
@@ -115,25 +229,23 @@ def apollo_post(endpoint, payload, key):
     return r.json()
 
 def claude_resolve_names(company_list, key):
-    """Use Claude's semantic knowledge to resolve Iberian company names to their
-    most likely Apollo-indexed form (international legal name + domain)."""
+    """Use Claude's semantic knowledge to resolve company names to their most likely Apollo-indexed form."""
     block = "\n".join(f"- {c}" for c in company_list)
-    prompt = f"""You are resolving Iberian company names to their most likely Apollo.io database entries.
-Apollo indexes companies by their international/English legal name, not their Spanish trade name.
+    prompt = f"""You are helping match company names to their Apollo.io database entries.
 
 For each company return:
-- canonical_name: most likely Apollo-indexed name (international/English legal name)
-- domain: primary web domain if you know it (e.g. mahou.es, mango.com) — empty string if unsure
-- alt_names: up to 2 fallback name variants to try if canonical fails
+- canonical_name: the most likely name Apollo.io uses to index this company. This may be identical to the original name, or a known variant (e.g. without legal suffix, parent company name, common trade name). Do NOT translate to English — use whatever name Apollo most likely uses.
+- domain: primary web domain if you know it (e.g. lupa.es, mango.com) — empty string if unsure
+- alt_names: up to 2 additional name variants to try as fallbacks (e.g. with/without legal suffix, abbreviated name, parent brand)
 
 COMPANIES:
 {block}
 
-Resolution examples:
-- "Grupo Mahou San Miguel" → canonical: "Mahou-San Miguel Group", domain: "mahou.es"
-- "El Corte Inglés" → canonical: "El Corte Ingles", domain: "elcorteingles.es"
-- "Clínica Baviera" → canonical: "Baviera Group", domain: "clinicabaviera.com"
-- "Laboratorios Rovi" → canonical: "Rovi Pharmaceuticals", domain: "rovi.es"
+Examples of correct resolution:
+- "Lupa Supermercados" → canonical: "Lupa Supermercados", domain: "lupa.es", alt_names: ["Lupa"]
+- "Grupo Mahou San Miguel" → canonical: "Mahou San Miguel", domain: "mahou.es", alt_names: ["Mahou-San Miguel", "Grupo Mahou"]
+- "El Corte Inglés" → canonical: "El Corte Ingles", domain: "elcorteingles.es", alt_names: ["El Corte Inglés"]
+- "Clínica Baviera" → canonical: "Clinica Baviera", domain: "clinicabaviera.com", alt_names: ["Baviera"]
 
 Return ONLY a JSON array, one object per company in the same order:
 [{{"company":"","canonical_name":"","domain":"","alt_names":[]}}]"""
@@ -147,58 +259,141 @@ Return ONLY a JSON array, one object per company in the same order:
 
 
 def enrich_org(resolved, key):
-    """Try canonical name, alt names, then original — stop at first Apollo hit."""
+    """Try original name first, then Claude's canonical, then alt names — stop at first Apollo hit.
+    On hit: fetch full org intelligence via organizations/enrich using Apollo's own primary_domain."""
     original  = resolved.get("company", "")
     canonical = resolved.get("canonical_name") or original
     alt_names = resolved.get("alt_names") or []
 
     candidates = []
-    if canonical:
+    if original:
+        candidates.append(original)
+    if canonical and canonical not in candidates:
         candidates.append(canonical)
     for alt in alt_names:
         if alt and alt not in candidates:
             candidates.append(alt)
-    if original and original not in candidates:
-        candidates.append(original)
 
     for name in candidates:
         try:
             data = apollo_post("mixed_companies/search", {
                 "q_organization_name": name,
-                "organization_locations": ["Spain"],
                 "page": 1, "per_page": 1,
             }, key)
-            orgs = data.get("organizations", [])
-            if orgs:
-                orgs[0]["_resolved_name"] = name
-                return orgs[0]
+            orgs = data.get("accounts", []) or data.get("organizations", [])
+            if not orgs:
+                continue
+            account = orgs[0]
+            account["_resolved_name"] = name
+
+            # Fetch full intelligence record using Apollo's own domain
+            domain = account.get("primary_domain") or account.get("domain", "")
+            if domain:
+                try:
+                    enrich_data = apollo_post("organizations/enrich", {"domain": domain}, key)
+                    org_intel   = enrich_data.get("organization") or {}
+                    # Merge intelligence fields into account object
+                    for field in ["technology_names", "funding_events", "job_postings",
+                                  "estimated_num_employees", "total_funding",
+                                  "short_description", "keywords"]:
+                        if org_intel.get(field):
+                            account[field] = org_intel[field]
+                    account["_enrich_credits"] = 1
+                except Exception:
+                    account["_enrich_credits"] = 0
+            else:
+                account["_enrich_credits"] = 0
+
+            return account
         except Exception:
             continue
     return None
 
-def search_people(company_name, domain, titles, key, max_results=2):
-    contacts, seen = [], set()
+SENIORITY_BY_PRIORITY = {
+    "Hot":  ["c_suite", "vp"],
+    "Warm": ["director", "manager"],
+    "Cold": ["manager", "senior"],
+}
+
+def unlock_person(person_id, key):
+    """Reveal name/email for a locked Apollo contact. Returns enriched person dict or None."""
     try:
-        payload = {"page":1, "per_page":max_results, "person_titles": titles[:5]}
+        data = apollo_post("people/match", {"id": person_id, "reveal_personal_emails": False}, key)
+        return data.get("person")
+    except Exception:
+        return None
+
+def _email_domain_matches(email, company_domain):
+    """Return True if email domain matches company domain, or if either is unknown."""
+    if not email or not company_domain:
+        return True
+    email_domain = email.split("@")[-1].lower().strip()
+    return email_domain == company_domain.lower().strip()
+
+def search_people(company_name, domain, titles, key, max_results=2, priority="Warm"):
+    contacts, seen = [], set()
+
+    def _run_search(payload):
+        """Try q_organization_name first, fall back to domain."""
+        payload_name = {**payload, "q_organization_name": company_name}
+        try:
+            data = apollo_post("mixed_people/api_search", payload_name, key)
+            results = data.get("people", [])
+            if results:
+                return results
+        except Exception:
+            pass
         if domain:
-            payload["organization_domains"] = [domain]
-        else:
-            payload["q_organization_name"] = company_name
-        data = apollo_post("mixed_people/api_search", payload, key)
-        for p in data.get("people", []):
+            payload_domain = {**payload, "organization_domains": [domain]}
+            try:
+                data = apollo_post("mixed_people/api_search", payload_domain, key)
+                return data.get("people", [])
+            except Exception:
+                pass
+        return []
+
+    # Pass 1 — title-based search
+    for p in _run_search({"page":1, "per_page": max_results + 2, "person_titles": titles[:10]}):
+        if p.get("id") not in seen:
+            contacts.append(p)
+            seen.add(p["id"])
+
+    # Pass 2 — seniority fallback if no results from titles
+    if not contacts:
+        seniority = SENIORITY_BY_PRIORITY.get(priority, ["director"])
+        for p in _run_search({"page":1, "per_page": max_results + 2, "person_seniority": seniority}):
             if p.get("id") not in seen:
                 contacts.append(p)
                 seen.add(p["id"])
-    except Exception:
-        pass
-    return contacts[:max_results]
+
+    # Unlock + domain-validate
+    verified, seen_names = [], set()
+    unlock_credits = 0
+    for p in contacts:
+        if len(verified) >= max_results:
+            break
+        unlocked = unlock_person(p.get("id"), key)
+        unlock_credits += 1
+        if not unlocked:
+            continue
+        name = unlocked.get("name") or ""
+        if not name or name in seen_names:
+            continue
+        email = unlocked.get("email") or ""
+        if not _email_domain_matches(email, domain):
+            continue
+        unlocked["_original"] = p
+        verified.append(unlocked)
+        seen_names.add(name)
+
+    return verified, unlock_credits
 
 def score_apollo(stage1_score, apollo_org):
     if not apollo_org:
         return {"bonus":0, "final_score":stage1_score, "signals":{},
                 "account_type":"Unknown", "technologies":[],
                 "employees":None, "funding_total":None, "funding_date":None,
-                "domain":None, "linkedin":None}
+                "domain":None, "linkedin":None, "crm_job_titles":[]}
 
     bonus, signals = 0, {}
     raw_tech  = apollo_org.get("technology_names") or []
@@ -257,7 +452,7 @@ def score_apollo(stage1_score, apollo_org):
 
     # Domain
     domain = (apollo_org.get("primary_domain")
-              or apollo_org.get("website_url","").replace("http://","")
+              or (apollo_org.get("website_url") or "").replace("http://","")
                  .replace("https://","").split("/")[0])
 
     return {
@@ -407,6 +602,13 @@ OUTREACH ANGLES by account type:
 - Green Field Transformation: Customer 360 unification, replace spreadsheets/point solutions
 - Green Field Displacement: competitor weaknesses, migration path, better ROI
 - Existing Business: expansion (more clouds, Agentforce, Data Cloud, AI)
+
+SEARCH TITLES RULES:
+- Provide 8–10 title variants per persona covering both English and Spanish versions
+- Include abbreviations (CIO, CDO, CTO), full titles, and common Iberian variants
+- Example for CIO persona: ["CIO", "Chief Information Officer", "Director de Sistemas", "Director de Tecnología", "Director TI", "Director de Informática", "IT Director", "Head of IT", "Chief Technology Officer", "CTO"]
+- Example for CRM persona: ["CRM Director", "Director CRM", "Sales Operations Director", "Director de Operaciones Comerciales", "Head of CRM", "CRM Manager", "Director de Ventas", "Sales Director", "Commercial Director", "Director Comercial"]
+- Broader is always better — Apollo will filter by relevance
 
 Return ONLY a JSON array, one object per company in the same order:
 [{{
@@ -563,13 +765,51 @@ if uploaded_files and not st.session_state.prefilter_done:
         st.caption(f"📄 {f.name} → {added} companies · source: **{src}**")
 
     all_companies = list(company_sources.keys())
-    st.info(f"**{len(all_companies)} unique companies** loaded. Pre-filter will remove obvious low-potential accounts before Stage 1.")
+
+    # ── Pre-filter cache preview ───────────────────────────────────────────────
+    pf_cache     = load_prefilter_cache()
+    cached_pf    = [c for c in all_companies if _cache_key(c) in pf_cache]
+    new_pf       = [c for c in all_companies if _cache_key(c) not in pf_cache]
+
+    col_pfc, col_pfn, col_pft = st.columns(3)
+    col_pfc.metric("⚡ From cache", len(cached_pf))
+    col_pfn.metric("✨ New to Claude", len(new_pf))
+    col_pft.metric("Total", len(all_companies))
+    if cached_pf:
+        st.caption(f"✅ {len(cached_pf)} account(s) pre-filtered in the last {CACHE_TTL_DAYS} days will be loaded instantly.")
+
+    btn_pf_label = (
+        f"🔍 Run Pre-Filter ({len(new_pf)} new accounts)"
+        if new_pf else
+        f"⚡ Load Pre-Filter from Cache ({len(cached_pf)} accounts)"
+    )
 
     if not (anthropic_key and anthropic_key.startswith("sk-ant-")):
-        st.warning("Enter a valid Anthropic API key in the sidebar.")
-    elif st.button("🔍 Run Pre-Filter", type="primary"):
-        with st.spinner(f"Screening {len(all_companies)} companies in one Claude call..."):
-            pf = claude_prefilter(all_companies, anthropic_key)
+        st.warning("Anthropic API key not found in .env file.")
+    elif st.button(btn_pf_label, type="primary"):
+        pf_cache = load_prefilter_cache()
+        pf = []
+
+        # Serve cached decisions
+        for company in cached_pf:
+            entry = dict(pf_cache[_cache_key(company)])
+            pf.append(entry)
+
+        # Run Claude only on new companies
+        if new_pf:
+            with st.spinner(f"Screening {len(new_pf)} new companies in one Claude call..."):
+                new_results = claude_prefilter(new_pf, anthropic_key)
+            now = datetime.now(timezone.utc).isoformat()
+            for r in new_results:
+                r["cached_at"] = now
+                pf_cache[_cache_key(r["company"])] = r
+                pf.append(r)
+            save_prefilter_cache(pf_cache)
+
+        # Preserve original upload order
+        order = {c: i for i, c in enumerate(all_companies)}
+        pf.sort(key=lambda r: order.get(r.get("company",""), 9999))
+
         st.session_state.prefilter_results = pf
         st.session_state.company_sources   = company_sources
         st.session_state.prefilter_done    = True
@@ -605,12 +845,18 @@ if st.session_state.prefilter_done and st.session_state.stage == 0:
     if discarded:
         with st.expander(f"❌ Discarded accounts ({len(discarded)}) — click to review and restore"):
             st.caption("Check ↩ Restore to add an account back. AE relationship context may override the pre-filter.")
+            if "restore_all" not in st.session_state:
+                st.session_state.restore_all = False
+            if st.button("☑️ Select All", key="select_all_discarded"):
+                st.session_state.restore_all = True
+            if st.button("Clear All", key="clear_all_discarded"):
+                st.session_state.restore_all = False
             discard_df = pd.DataFrame([{
                 "Company":     r["company"],
                 "AE":          cs.get(r["company"], ""),
                 "Reason":      r.get("reason", ""),
                 "Detail":      r.get("detail", ""),
-                "↩ Restore":   False,
+                "↩ Restore":   st.session_state.restore_all,
             } for r in discarded])
             edited_discard = st.data_editor(
                 discard_df,
@@ -625,24 +871,62 @@ if st.session_state.prefilter_done and st.session_state.stage == 0:
                 st.caption(f"↩ {len(restored_companies)} account(s) will be restored to Stage 1.")
 
     total_proceeding = len(kept) + len(restored_companies)
-    if st.button(f"🧠 Confirm & Run Stage 1 — Claude Full Scoring ({total_proceeding} accounts)", type="primary"):
-        final_companies = [r["company"] for r in kept] + restored_companies
-        batches  = [final_companies[i:i+BATCH_SIZE] for i in range(0, len(final_companies), BATCH_SIZE)]
+    final_companies  = [r["company"] for r in kept] + restored_companies
+
+    # ── Cache preview (shown immediately after pre-filter) ────────────────────
+    cache        = load_stage1_cache()
+    cached_cos   = [c for c in final_companies if _cache_key(c) in cache]
+    new_cos      = [c for c in final_companies if _cache_key(c) not in cache]
+
+    st.markdown("---")
+    st.markdown("**⚡ Stage 1 Cache Status**")
+    col_c, col_n, col_t = st.columns(3)
+    col_c.metric("⚡ From cache", len(cached_cos))
+    col_n.metric("✨ New to Claude", len(new_cos))
+    col_t.metric("Total", total_proceeding)
+    if cached_cos:
+        st.caption(f"✅ {len(cached_cos)} account(s) scored in the last {CACHE_TTL_DAYS} days will be loaded instantly — only {len(new_cos)} new accounts will go to Claude.")
+
+    btn_label = (
+        f"🧠 Confirm & Run Stage 1 — Claude Full Scoring ({len(new_cos)} new accounts)"
+        if new_cos else
+        f"⚡ Load Stage 1 from Cache ({len(cached_cos)} accounts)"
+    )
+    if st.button(btn_label, type="primary"):
+        s1      = []
+        cache   = load_stage1_cache()
         progress = st.progress(0)
         status   = st.empty()
-        s1       = []
-        for i, batch in enumerate(batches):
-            status.text(f"🧠 Batch {i+1}/{len(batches)}: {', '.join(batch[:3])}...")
-            results = claude_stage1(batch, anthropic_key)
-            for r in results:
-                r["ae_source"] = st.session_state.company_sources.get(r.get("company",""), "")
-            s1.extend(results)
-            progress.progress((i+1)/len(batches))
+        total    = len(final_companies)
 
+        # Serve cached accounts first
+        for company in cached_cos:
+            entry = cache[_cache_key(company)]
+            entry["ae_source"]   = st.session_state.company_sources.get(company, "")
+            entry["from_cache"]  = True
+            s1.append(entry)
+
+        # Score new accounts via Claude
+        if new_cos:
+            batches = [new_cos[i:i+BATCH_SIZE] for i in range(0, len(new_cos), BATCH_SIZE)]
+            for i, batch in enumerate(batches):
+                status.text(f"🧠 Batch {i+1}/{len(batches)}: {', '.join(batch[:3])}...")
+                results = claude_stage1(batch, anthropic_key)
+                for r in results:
+                    r["ae_source"]  = st.session_state.company_sources.get(r.get("company",""), "")
+                    r["from_cache"] = False
+                    r["cached_at"]  = datetime.now(timezone.utc).isoformat()
+                    cache[_cache_key(r["company"])] = r
+                s1.extend(results)
+                progress.progress((len(cached_cos) + sum(len(batches[j]) for j in range(i+1))) / total)
+
+            save_stage1_cache(cache)
+
+        progress.progress(1.0)
         s1.sort(key=lambda x: x.get("score", 0), reverse=True)
         st.session_state.stage1_results = s1
         st.session_state.stage          = 1
-        status.success(f"✅ Stage 1 complete — {len(s1)} accounts tiered.")
+        status.success(f"✅ Stage 1 complete — {len(cached_cos)} from cache, {len(new_cos)} freshly scored.")
         st.rerun()
 
 
@@ -655,6 +939,7 @@ if st.session_state.stage == 1 and st.session_state.stage1_results:
     st.caption(f"Override tiers or mark accounts as 'Remove' before Apollo spend. Recommended: score ≥ {APOLLO_MIN_SCORE} for Apollo enrichment. Accounts scoring 25–27 may return limited data for Iberian companies.")
 
     s1 = st.session_state.stage1_results
+    cache_now = load_stage1_cache()
     review_df = pd.DataFrame([{
         "Company":        r.get("company",""),
         "AE":             r.get("ae_source",""),
@@ -665,6 +950,8 @@ if st.session_state.stage == 1 and st.session_state.stage1_results:
         "Account Type":   r.get("account_type_hint",""),
         "Triggers":       ", ".join(r.get("trigger_events",[])),
         "Narrative":      r.get("narrative",""),
+        "Source":         "⚡ cached" if r.get("from_cache") else "✨ new",
+        "Cache expires":  f"{cache_days_remaining(cache_now[_cache_key(r.get('company',''))])}d" if _cache_key(r.get("company","")) in cache_now else "—",
     } for r in s1])
 
     show_all = st.checkbox("Show Low Priority accounts", value=False)
@@ -703,67 +990,111 @@ if st.session_state.stage == 1 and st.session_state.stage1_results:
     if len(below_threshold) > 0:
         st.caption(f"⚠️ {len(below_threshold)} account(s) scoring 25–27 are excluded by default — change their Override Tier to B Prime or A Strategic above to include them.")
 
+    # ── Stage 2 cache preview ─────────────────────────────────────────────────
+    s2_cache     = load_stage2_cache()
+    all_rows     = confirmed.to_dict("records")
+    cached_s2    = [r for r in all_rows if _cache_key(r["Company"]) in s2_cache]
+    new_s2       = [r for r in all_rows if _cache_key(r["Company"]) not in s2_cache]
+
+    col_c2, col_n2, col_t2 = st.columns(3)
+    col_c2.metric("⚡ From cache", len(cached_s2))
+    col_n2.metric("🔍 New to Apollo", len(new_s2))
+    col_t2.metric("Total", len(all_rows))
+    if cached_s2:
+        st.caption(f"✅ {len(cached_s2)} account(s) enriched in the last {CACHE_TTL_DAYS} days will be loaded instantly.")
+
+    btn_s2_label = (
+        f"🔍 Confirm & Run Apollo — Stage 2 ({len(new_s2)} new accounts)"
+        if new_s2 else
+        f"⚡ Load Stage 2 from Cache ({len(cached_s2)} accounts)"
+    )
+
     if not apollo_key:
-        st.warning("Enter your Apollo API key in the sidebar to proceed.")
-    elif st.button("🔍 Confirm & Run Apollo — Stage 2", type="primary"):
-        rows     = confirmed.to_dict("records")
+        st.warning("Apollo API key not found in .env file.")
+    elif st.button(btn_s2_label, type="primary"):
+        rows     = all_rows
         progress = st.progress(0)
         status   = st.empty()
         s2       = []
+        s2_cache = load_stage2_cache()
         triggers_by_company = {r.get("company",""): r.get("trigger_events",[])
                                 for r in st.session_state.stage1_results}
 
-        # Semantic name resolution — one Claude call for all companies
-        status.text("🧠 Claude resolving company names for Apollo search...")
-        company_names = [row["Company"] for row in rows]
-        resolved_list = claude_resolve_names(company_names, anthropic_key)
-        resolved_map  = {r.get("company",""): r for r in resolved_list}
+        run_credits = 0
 
-        for i, row in enumerate(rows):
-            status.text(f"🔍 Apollo enriching {i+1}/{len(rows)}: {row['Company']}...")
-            resolved   = resolved_map.get(row["Company"],
-                             {"company": row["Company"], "canonical_name": row["Company"],
-                              "domain": "", "alt_names": []})
-            apollo_org = enrich_org(resolved, apollo_key)
-            scoring    = score_apollo(row["Score"], apollo_org)
+        # Serve cached accounts
+        for row in cached_s2:
+            entry = dict(s2_cache[_cache_key(row["Company"])])
+            # Update mutable fields from current run
+            entry["stage1_score"]  = row["Score"]
+            entry["stage1_tier"]   = row["Claude Tier"]
+            entry["override_tier"] = row["Override Tier"]
+            entry["from_s2_cache"] = True
+            entry["apollo_credits"] = 0  # no credits spent — served from cache
+            s2.append(entry)
 
-            final_tier = score_to_tier(scoring["final_score"])
-            override   = row["Override Tier"]
-            # Respect manual override if it demotes the account
-            if TIER_ORDER.get(override,99) > TIER_ORDER.get(final_tier,99):
-                final_tier = override
+        # Resolve + enrich only new accounts
+        if new_s2:
+            status.text("🧠 Claude resolving company names for Apollo search...")
+            company_names = [row["Company"] for row in new_s2]
+            resolved_list = claude_resolve_names(company_names, anthropic_key)
+            resolved_map  = {r.get("company",""): r for r in resolved_list}
 
-            s2.append({
-                "company":          row["Company"],
-                "ae_source":        row["AE"],
-                "industry":         row["Industry"],
-                "narrative":        row["Narrative"],
-                "stage1_score":     row["Score"],
-                "stage1_tier":      row["Claude Tier"],
-                "override_tier":    override,
-                "apollo_bonus":     scoring["bonus"],
-                "final_score":      scoring["final_score"],
-                "final_tier":       final_tier,
-                "account_type":     scoring["account_type"],
-                "sig_salesforce":   scoring["signals"].get("salesforce_in_stack", False),
-                "sig_funding":      bool(scoring["signals"].get("recent_funding", False)),
-                "sig_crm_hiring":   scoring["signals"].get("crm_hiring", False),
-                "crm_job_titles":   scoring["crm_job_titles"],
-                "technologies":     scoring["technologies"],
-                "employees":        scoring["employees"],
-                "funding_total":    scoring["funding_total"],
-                "domain":           scoring["domain"] or resolved.get("domain",""),
-                "linkedin":         scoring["linkedin"],
-                "trigger_events":   triggers_by_company.get(row["Company"], []),
-                "apollo_name_used": apollo_org.get("_resolved_name","") if apollo_org else "",
-                "apollo_canonical": resolved.get("canonical_name",""),
-            })
-            progress.progress((i+1)/len(rows))
+            for i, row in enumerate(new_s2):
+                status.text(f"🔍 Apollo enriching {i+1}/{len(new_s2)}: {row['Company']}...")
+                resolved   = resolved_map.get(row["Company"],
+                                 {"company": row["Company"], "canonical_name": row["Company"],
+                                  "domain": "", "alt_names": []})
+                apollo_org = enrich_org(resolved, apollo_key)
+                scoring    = score_apollo(row["Score"], apollo_org)
 
+                final_tier = score_to_tier(scoring["final_score"])
+                override   = row["Override Tier"]
+                if TIER_ORDER.get(override,99) > TIER_ORDER.get(final_tier,99):
+                    final_tier = override
+
+                credits = apollo_org.get("_enrich_credits", 0) if apollo_org else 0
+                run_credits += credits
+                entry = {
+                    "company":          row["Company"],
+                    "ae_source":        row["AE"],
+                    "industry":         row["Industry"],
+                    "narrative":        row["Narrative"],
+                    "stage1_score":     row["Score"],
+                    "stage1_tier":      row["Claude Tier"],
+                    "override_tier":    override,
+                    "apollo_bonus":     scoring["bonus"],
+                    "final_score":      scoring["final_score"],
+                    "final_tier":       final_tier,
+                    "account_type":     scoring["account_type"],
+                    "sig_salesforce":   scoring["signals"].get("salesforce_in_stack", False),
+                    "sig_funding":      bool(scoring["signals"].get("recent_funding", False)),
+                    "sig_crm_hiring":   scoring["signals"].get("crm_hiring", False),
+                    "crm_job_titles":   scoring["crm_job_titles"],
+                    "technologies":     scoring["technologies"],
+                    "employees":        scoring["employees"],
+                    "funding_total":    scoring["funding_total"],
+                    "domain":           scoring["domain"] or resolved.get("domain",""),
+                    "linkedin":         scoring["linkedin"],
+                    "trigger_events":   triggers_by_company.get(row["Company"], []),
+                    "apollo_name_used": apollo_org.get("_resolved_name","") if apollo_org else "",
+                    "apollo_canonical": resolved.get("canonical_name",""),
+                    "apollo_credits":   credits,
+                    "from_s2_cache":    False,
+                    "cached_at":        datetime.now(timezone.utc).isoformat(),
+                }
+                s2.append(entry)
+                s2_cache[_cache_key(row["Company"])] = entry
+                progress.progress((len(cached_s2) + i + 1) / len(rows))
+
+            save_stage2_cache(s2_cache)
+
+        progress.progress(1.0)
         s2.sort(key=lambda x: x.get("final_score",0), reverse=True)
-        st.session_state.stage2_results = s2
-        st.session_state.stage          = 2
-        status.success(f"✅ Stage 2 complete — {len(s2)} accounts enriched.")
+        st.session_state.stage2_results  = s2
+        st.session_state.stage           = 2
+        st.session_state.s2_run_credits  = run_credits
+        status.success(f"✅ Stage 2 complete — {len(cached_s2)} from cache, {len(new_s2)} freshly enriched · 🔋 {run_credits} Apollo credits used.")
         st.rerun()
 
 
@@ -800,11 +1131,16 @@ if st.session_state.stage >= 2 and st.session_state.stage2_results:
     c4.metric("Apollo Hit Rate",f"{hit_rate}%",
               delta=f"↑ name resolution: {len(resolved_hit)} via canonical/alt" if resolved_hit else None)
 
+    total_s2_credits = sum(r.get("apollo_credits", 0) for r in s2)
     c5, c6, c7, c8 = st.columns(4)
     c5.metric("Existing Business", len(eb))
     c6.metric("Green Field",       len(gf))
     c7.metric("No Apollo Data",    len(no_apollo))
     c8.metric("Avg Apollo Bonus",  f"+{avg_bonus}")
+
+    cr1, cr2 = st.columns(2)
+    cr1.metric("🔋 Apollo Credits This Run", st.session_state.s2_run_credits)
+    cr2.metric("🔋 Apollo Credits Total (cached incl.)", total_s2_credits)
 
     # ── Name resolution summary ────────────────────────────────────────────────
     canon_fixed = [r for r in s2 if r.get("apollo_canonical") and
@@ -950,6 +1286,7 @@ if st.session_state.stage >= 2 and st.session_state.stage2_results:
   <th style="text-align:center">Final Score</th>
   <th>Final Tier</th><th>Account Type</th>
   <th>Apollo Signals</th><th>Employees</th><th>Top Technologies</th>
+  <th style="text-align:center">🔋 Credits</th>
 </tr></thead><tbody>"""
 
     for r in s2:
@@ -1011,6 +1348,8 @@ if st.session_state.stage >= 2 and st.session_state.stage2_results:
   <td>{_signals_html(r)}</td>
   <td style="text-align:center;color:#6b7280;font-size:12px">{emp_str}</td>
   <td class="techlist">{tech_str}</td>
+  <td style="text-align:center;font-size:12px;color:{'#16a34a' if r.get('apollo_credits',0)==0 else '#b45309'}">
+    {'⚡ 0' if r.get('from_s2_cache') else f"🔋 {r.get('apollo_credits',0)}"}</td>
 </tr>"""
 
     tbl_html += "</tbody></table>"
@@ -1141,22 +1480,26 @@ if st.session_state.stage >= 2 and st.session_state.stage2_results:
             elif st.button("👥 Run People Search — Stage 3b", type="primary"):
                 progress = st.progress(0)
                 status   = st.empty()
-                s3       = []
+                s3             = []
+                s3_run_credits = 0
 
                 for i, account in enumerate(tier_a):
                     status.text(f"👥 Apollo finding leads {i+1}/{len(tier_a)}: {account['company']}...")
                     p_data    = personas_map.get(account["company"], {})
                     committee = p_data.get("buying_committee", [])
                     all_leads, seen_names = [], set()
+                    acct_unlock_credits = 0
 
                     for persona in committee:
                         titles = persona.get("search_titles", [])
                         if not titles:
                             continue
-                        people = search_people(
+                        people, unlock_credits = search_people(
                             account["company"], account.get("domain",""),
-                            titles, apollo_key, max_results=2
+                            titles, apollo_key, max_results=2,
+                            priority=persona.get("priority","Warm")
                         )
+                        acct_unlock_credits += unlock_credits
                         for person in people:
                             name = person.get("name","")
                             if name and name not in seen_names:
@@ -1176,22 +1519,25 @@ if st.session_state.stage >= 2 and st.session_state.stage2_results:
                                 seen_names.add(name)
 
                     all_leads.sort(key=lambda l: {"Hot":0,"Warm":1,"Cold":2}.get(l.get("priority","Cold"),2))
+                    s3_run_credits += acct_unlock_credits
 
                     s3.append({
                         **account,
-                        "buying_committee": committee,
-                        "outreach_angle":   p_data.get("outreach_angle",""),
-                        "why_now":          p_data.get("why_now",""),
-                        "value_pillar":     p_data.get("value_pillar",""),
-                        "leads":            all_leads,
+                        "buying_committee":  committee,
+                        "outreach_angle":    p_data.get("outreach_angle",""),
+                        "why_now":           p_data.get("why_now",""),
+                        "value_pillar":      p_data.get("value_pillar",""),
+                        "leads":             all_leads,
+                        "unlock_credits":    acct_unlock_credits,
                     })
                     progress.progress((i+1)/len(tier_a))
 
                 s3.sort(key=lambda x: x.get("final_score",0), reverse=True)
-                st.session_state.stage3_results = s3
-                st.session_state.stage          = 3
+                st.session_state.stage3_results  = s3
+                st.session_state.stage           = 3
+                st.session_state.s3_run_credits  = s3_run_credits
                 total_leads = sum(len(r["leads"]) for r in s3)
-                status.success(f"✅ Lead intelligence complete — {total_leads} leads found across {len(s3)} accounts.")
+                status.success(f"✅ Lead intelligence complete — {total_leads} leads found across {len(s3)} accounts · 🔋 {s3_run_credits} Apollo unlock credits used.")
                 st.rerun()
 
 
@@ -1205,9 +1551,17 @@ if st.session_state.stage >= 3 and st.session_state.stage3_results:
     s3 = st.session_state.stage3_results
     tier_icon = {"A Strategic":"🟢","B Prime":"🔵","C Monitor":"🟡"}
 
+    total_leads   = sum(len(r.get("leads",[])) for r in s3)
+    total_credits = sum(r.get("unlock_credits",0) for r in s3)
+    s3c1, s3c2, s3c3 = st.columns(3)
+    s3c1.metric("Accounts",       len(s3))
+    s3c2.metric("Total Leads",    total_leads)
+    s3c3.metric("🔋 Unlock Credits", total_credits)
+
     for r in s3:
-        icon = tier_icon.get(r.get("final_tier",""),"⚪")
-        with st.expander(f"{icon} **{r['company']}** · Score {r['final_score']} · {r['account_type']}"):
+        icon    = tier_icon.get(r.get("final_tier",""),"⚪")
+        credits = r.get("unlock_credits", 0)
+        with st.expander(f"{icon} **{r['company']}** · Score {r['final_score']} · {r['account_type']} · 🔋 {credits} credits"):
             c1, c2 = st.columns([1,2])
             with c1:
                 st.markdown(f"""

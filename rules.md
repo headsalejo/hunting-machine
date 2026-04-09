@@ -23,6 +23,14 @@ One single Claude call processes the entire uploaded list.
 - No scoring, no narrative, binary only
 - AE can review and restore any discarded account before proceeding
 
+### ⚡ 7-Day Pre-Filter Cache
+- Pre-filter decisions are cached locally in `prefilter_cache.json` for 7 days
+- On each run, companies already screened within the last 7 days are loaded instantly — only new companies go to Claude
+- Cache status (⚡ From cache / ✨ New to Claude / Total) shown after file upload, before the pre-filter button
+- Cache key is company name (lowercased/stripped)
+- Cache entries expire automatically after 7 days
+- Upload order is preserved when merging cached and new results
+
 ---
 
 ## STAGE 1 — Claude First Tiering
@@ -34,6 +42,12 @@ One single Claude call processes the entire uploaded list.
 - Strong bias toward Consumer Goods & Retail
 
 ### Batch size: 10 companies per Claude call
+
+### ⚡ 7-Day Score Cache
+- Stage 1 scores are cached locally in `stage1_cache.json` for 7 days
+- On each run, accounts found in cache are loaded instantly — only new accounts go to Claude
+- Cache status (⚡ From cache / ✨ New to Claude / Total) shown after pre-filter, before the Stage 1 button
+- Cache entries expire automatically after 7 days
 
 ### 🏢 Account Scoring (Max 50 Points)
 
@@ -104,27 +118,28 @@ Before Apollo credits are spent, accounts must be reviewed:
 ## STAGE 2 — Apollo Name Resolution (before enrichment)
 
 ### Problem
-AEs upload Spanish company names. Apollo indexes international/English legal names.
-Direct string matching fails for a significant portion of Iberian accounts.
-
-| AE Upload | Apollo Record |
-|-----------|--------------|
-| Grupo Mahou San Miguel | Mahou-San Miguel Group |
-| El Corte Inglés | El Corte Ingles |
-| Clínica Baviera | Baviera Group |
-| Laboratorios Rovi | Rovi Pharmaceuticals |
+AEs upload company names that may not exactly match how Apollo indexes them.
+Direct string matching fails for a significant portion of accounts.
 
 ### Solution — Claude Semantic Name Resolution
 Before any Apollo search, send all company names to Claude in a single batch call.
-Claude resolves each company to its most likely Apollo-indexed form:
-- `canonical_name` — international/English legal name
-- `domain` — primary web domain (e.g. mahou.es, mango.com)
+Claude resolves each company to its most likely Apollo-indexed form — which may be identical to the original, a known trade name variant, or a parent brand. No translation to English is applied.
+
+| AE Upload | Apollo Canonical | Alt Names |
+|-----------|-----------------|-----------|
+| Lupa Supermercados | Lupa Supermercados | Lupa |
+| Grupo Mahou San Miguel | Mahou San Miguel | Mahou-San Miguel, Grupo Mahou |
+| El Corte Inglés | El Corte Ingles | El Corte Inglés |
+| Clínica Baviera | Clinica Baviera | Baviera |
+
+Claude also resolves:
+- `domain` — primary web domain (e.g. lupa.es, mahou.es)
 - `alt_names` — up to 2 fallback variants
 
 ### Search Strategy (per account)
-1. Try `canonical_name` first
-2. Try each `alt_name` in order
-3. Try original AE-uploaded name last
+1. Try original AE-uploaded name first
+2. Try `canonical_name` (Claude's resolved form)
+3. Try each `alt_name` in order
 4. Stop at first Apollo hit — record which name matched
 5. If all fail → no Apollo data, Stage 1 score stands
 
@@ -142,6 +157,21 @@ Claude resolves each company to its most likely Apollo-indexed form:
 Apollo data quality for the Iberian market is variable. If Apollo returns no
 data for an account, the Stage 1 score stands unchanged. Apollo is a bonus
 layer, not a dependency.
+
+### Two-Call Enrichment Strategy
+- `mixed_companies/search` returns CRM account records — no intelligence fields (tech stack, funding, job postings are absent)
+- `organizations/enrich` by `primary_domain` returns the full intelligence record with all signal fields
+- `enrich_org` makes both calls and merges the results — 1 Apollo credit per `organizations/enrich` call
+- If `organizations/enrich` fails or returns no data, signals from the account record are used as fallback
+- Credit cost: 1 per enriched account (0 for cached accounts)
+
+### ⚡ 7-Day Apollo Cache
+- Apollo enrichment results are cached locally in `stage2_cache.json` for 7 days
+- On each run, accounts already enriched within the last 7 days are loaded instantly — only new accounts go to Apollo
+- Cache status (⚡ From cache / 🔍 New to Apollo / Total) shown before the Stage 2 button
+- Cache key is company name (lowercased/stripped)
+- Cache entries expire automatically after 7 days
+- Saves Apollo API credits on repeated runs with overlapping account lists
 
 ### Apollo Signals Used
 | Signal | Apollo Field | Bonus |
@@ -207,6 +237,34 @@ Apollo people search runs against the buying committee personas defined in Stage
 1. Search for **Hot Leads** first (C-Level, economic buyer, technical evaluator)
 2. Search for **Warm Leads** second (sponsor level, CRM/digital owners)
 3. Only search for **Cold Leads** if Hot and Warm are insufficient
+
+### Title Search Strategy
+- Claude generates 8–10 title variants per persona covering English and Spanish versions, abbreviations (CIO, CDO, CTO), and common Iberian variants
+- Apollo is queried with up to 10 titles per persona
+- Search uses `q_organization_name` as primary lookup — more reliable than domain matching for correctly associating contacts to companies
+- Falls back to `organization_domains` only if `q_organization_name` returns no results
+
+### Seniority Fallback
+If title search returns no verified leads after unlock and validation, a second Apollo call is made using `person_seniority`:
+| Persona Priority | Seniority Filter |
+|-----------------|-----------------|
+| Hot | `c_suite`, `vp` |
+| Warm | `director`, `manager` |
+| Cold | `manager`, `senior` |
+
+### Lead Unlock & Validation
+- Every candidate found is unlocked via Apollo's `people/match` endpoint to reveal name and email
+- Leads with no name after unlock are discarded
+- Leads whose email domain does not match the company domain are discarded — prevents stale or incorrectly associated contacts from entering the pipeline
+- If company domain is unknown, domain validation is skipped
+
+### Apollo Credit Tracking (Stage 3b)
+- Every `people/match` (unlock) call costs 1 Apollo credit — counted even when the lead fails domain validation
+- Credits are accumulated per account and stored in `unlock_credits` field of each Stage 3 result
+- Total run credits saved to `s3_run_credits` in session state
+- Stage 3 results display: 3 metrics at top — Accounts · Total Leads · 🔋 Unlock Credits
+- Per-account credit count shown in each expander header
+- Success message reports total unlock credits used across the run
 
 ### Data Fields to Capture per Lead
 - Full name, exact title

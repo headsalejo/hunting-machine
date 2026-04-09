@@ -3,3 +3,4 @@ __pycache__/
 .env
 *.html
 .DS_Store
+*_cache.json
