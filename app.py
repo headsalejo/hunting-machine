@@ -291,7 +291,7 @@ def claude_resolve_names(company_list, key):
     prompt = f"COMPANIES:\n{block}"
     try:
         return call_claude(prompt, _RESOLVE_NAMES_SYSTEM, key,
-                           max_tokens=1024, cache_system=True, model=CLAUDE_HAIKU_MODEL)
+                           max_tokens=1024, cache_system=True)
     except Exception:
         return [{"company": c, "canonical_name": c, "domain": "", "alt_names": []}
                 for c in company_list]
