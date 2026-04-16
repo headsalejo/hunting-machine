@@ -285,10 +285,12 @@ def apollo_post(endpoint, payload, key):
     time.sleep(APOLLO_DELAY)
     return r.json()
 
-def claude_resolve_names(company_list, key):
-    """Use Claude's semantic knowledge to resolve company names to their most likely Apollo-indexed form."""
+def claude_resolve_names(company_list, key, country=""):
+    """Use Claude's semantic knowledge to resolve company names to their most likely Apollo-indexed form.
+    If country is provided, biases resolution toward the local subsidiary and country-specific variants."""
     block = "\n".join(f"- {c}" for c in company_list)
-    prompt = f"COMPANIES:\n{block}"
+    country_line = f"Country/region priority: {country}\nBias resolution toward the {country} entity or local subsidiary. Prefer the {country}-specific domain and include geographic name variants in alt_names.\n\n" if country else ""
+    prompt = f"{country_line}COMPANIES:\n{block}"
     try:
         return call_claude(prompt, _RESOLVE_NAMES_SYSTEM, key,
                            max_tokens=1024, cache_system=True)
@@ -603,16 +605,20 @@ For discarded companies: reason = exact discard criteria phrase above, detail = 
 _RESOLVE_NAMES_SYSTEM = """You only respond with structured JSON arrays. Never wrap in markdown code blocks.
 You are helping match company names to their Apollo.io database entries.
 
+For each company, use your knowledge of the entity — its industry, headquarters country, parent group, local subsidiaries, known brand names, and how B2B databases typically index it — to resolve the most likely Apollo match.
+
 For each company return:
-- canonical_name: the most likely name Apollo.io uses to index this company. This may be identical to the original name, or a known variant (e.g. without legal suffix, parent company name, common trade name). Do NOT translate to English — use whatever name Apollo most likely uses.
-- domain: primary web domain if you know it (e.g. lupa.es, mango.com) — empty string if unsure
-- alt_names: up to 2 additional name variants to try as fallbacks (e.g. with/without legal suffix, abbreviated name, parent brand)
+- canonical_name: the name Apollo.io most likely uses to index this entity. Consider: does Apollo index the local subsidiary or the global parent? Does it use the legal name or the trade name? Is the company known under a different brand in English-language databases?
+- domain: the primary web domain of the entity Apollo is most likely to match. Use your knowledge — do NOT leave empty unless you have absolutely no knowledge of the entity.
+- alt_names: up to 3 fallback variants. Include geographic variants (e.g. "Dekra España", "Dekra Spain"), parent/subsidiary names, legal name variants, and accent-free versions where applicable.
+
+If a country/region priority is provided, bias your resolution toward the local subsidiary or country-specific entity and prefer the country-specific domain.
 
 Examples of correct resolution:
-- "Lupa Supermercados" → canonical: "Lupa Supermercados", domain: "lupa.es", alt_names: ["Lupa"]
-- "Grupo Mahou San Miguel" → canonical: "Mahou San Miguel", domain: "mahou.es", alt_names: ["Mahou-San Miguel", "Grupo Mahou"]
-- "El Corte Inglés" → canonical: "El Corte Ingles", domain: "elcorteingles.es", alt_names: ["El Corte Inglés"]
-- "Clínica Baviera" → canonical: "Clinica Baviera", domain: "clinicabaviera.com", alt_names: ["Baviera"]
+- "Lupa Supermercados" → canonical: "Lupa Supermercados", domain: "lupa.es", alt_names: ["Lupa", "Lupa Spain"]
+- "Grupo Mahou San Miguel" → canonical: "Mahou San Miguel", domain: "mahou.es", alt_names: ["Grupo Mahou", "Mahou-San Miguel"]
+- "Vodafone Spain" → canonical: "Vodafone Spain", domain: "vodafone.es", alt_names: ["Vodafone España", "Vodafone Espana", "Vodafone ES"]
+- "Dekra" (country: Spain) → canonical: "Dekra Expertise España", domain: "dekra.es", alt_names: ["Dekra España", "Dekra Espana", "DEKRA SE"]
 
 Return ONLY a JSON array, one object per company in the same order:
 [{"company":"","canonical_name":"","domain":"","alt_names":[]}]"""
@@ -1150,7 +1156,7 @@ if st.session_state.stage == 1 and st.session_state.stage1_results:
         if new_s2:
             status.text("🧠 Claude resolving company names for Apollo search...")
             company_names = [row["Company"] for row in new_s2]
-            resolved_list = claude_resolve_names(company_names, anthropic_key)
+            resolved_list = claude_resolve_names(company_names, anthropic_key, country=target_country.strip())
             resolved_map  = {r.get("company",""): r for r in resolved_list}
 
             for i, row in enumerate(new_s2):

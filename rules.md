@@ -132,29 +132,34 @@ Direct string matching fails for a significant portion of accounts.
 
 ### Solution — Claude Semantic Name Resolution
 Before any Apollo search, send all company names to Claude in a single batch call.
-Claude resolves each company to its most likely Apollo-indexed form — which may be identical to the original, a known trade name variant, or a parent brand. No translation to English is applied.
+Claude uses its entity knowledge — industry, HQ country, parent group, local subsidiaries, and how B2B databases index the company — to resolve the most likely Apollo match. This is semantic reasoning, not string transformation.
 
-| AE Upload | Apollo Canonical | Alt Names |
-|-----------|-----------------|-----------|
-| Lupa Supermercados | Lupa Supermercados | Lupa |
-| Grupo Mahou San Miguel | Mahou San Miguel | Mahou-San Miguel, Grupo Mahou |
-| El Corte Inglés | El Corte Ingles | El Corte Inglés |
-| Clínica Baviera | Clinica Baviera | Baviera |
+| AE Upload | Apollo Canonical | Domain | Alt Names |
+|-----------|-----------------|--------|-----------|
+| Lupa Supermercados | Lupa Supermercados | lupa.es | Lupa, Lupa Spain |
+| Grupo Mahou San Miguel | Mahou San Miguel | mahou.es | Grupo Mahou, Mahou-San Miguel |
+| Dekra (country: Spain) | Dekra Expertise España | dekra.es | Dekra España, Dekra Espana, DEKRA SE |
+| Vodafone Spain | Vodafone Spain | vodafone.es | Vodafone España, Vodafone Espana, Vodafone ES |
 
-Claude also resolves:
-- `domain` — primary web domain (e.g. lupa.es, mahou.es)
-- `alt_names` — up to 2 fallback variants
+Claude resolves:
+- `canonical_name` — the name Apollo most likely uses to index the entity (may be local subsidiary, not global parent)
+- `domain` — primary web domain; Claude uses entity knowledge and never leaves empty unless it has no knowledge of the company
+- `alt_names` — up to 3 fallback variants including geographic variants (e.g. "Dekra España", "Dekra Spain"), legal name variants, and accent-free versions
+
+### Country/region priority bias
+If **Country/region priority** is set in the sidebar, it is passed to Claude's name resolution call. Claude biases the canonical name and domain toward the local subsidiary or country-specific entity, and includes geographic name variants in `alt_names`. This directly improves Apollo hit rate for multinational companies with a distinct local presence (e.g. Dekra → Dekra Expertise España rather than DEKRA SE).
 
 ### Search Strategy (per account)
 1. Try original AE-uploaded name first
 2. Try `canonical_name` (Claude's resolved form)
 3. Try each `alt_name` in order
-4. Stop at first Apollo hit — record which name matched
+4. Stop at first Apollo hit that passes domain cross-validation — record which name matched
 5. If all fail → no Apollo data, Stage 1 score stands
 
 ### Design Principles
-- One Claude batch call for all accounts — minimal token cost (~$0.01–0.02 per run)
-- Semantic resolution: Claude understands the entity, not just the string
+- One Claude Sonnet batch call for all accounts — Sonnet is used (not Haiku) because entity knowledge quality directly gates enrichment accuracy
+- Semantic resolution: Claude reasons about the entity, not just the string — parent groups, local subsidiaries, B2B database indexing conventions
+- Geographic variants always included when country priority is set
 - Every resolved name and matched name stored for auditability
 - Graceful fallback — a failed resolution never blocks the pipeline
 
