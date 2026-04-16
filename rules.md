@@ -2,6 +2,15 @@
 
 ---
 
+## Sidebar Controls
+
+| Field | Behaviour when filled | Behaviour when blank |
+|-------|----------------------|---------------------|
+| **Country/region priority** | Adds `organization_locations` filter to Apollo's `mixed_companies/search` — surfaces local entity over group (e.g. "Spain" → Axactor Spain instead of Axactor Group) | No location filter applied — default Apollo behaviour |
+| **Run only for this account** | Bypasses uploaded file and pre-filter entirely. Resets all pipeline state automatically when the company name changes — no browser refresh needed. Override Tier at Stage 1 is forced to A Strategic regardless of score. Stage 3a and 3b tier filter is bypassed — all accounts from Stage 2 proceed regardless of final tier. | Normal uploaded-list flow |
+
+---
+
 ## PRE-FILTER — Binary Qualification (before Stage 1)
 
 ### Purpose
@@ -165,6 +174,12 @@ layer, not a dependency.
 - If `organizations/enrich` fails or returns no data, signals from the account record are used as fallback
 - Credit cost: 1 per enriched account (0 for cached accounts)
 
+### APOLLO TOKEN CONSUMPTION
+- **`organizations/enrich`** — **1 Apollo credit per account**
+- Only charged when a domain match is found and cross-validation passes
+- Accounts served from cache (≤7 days old): **0 credits**
+- If `organizations/enrich` fails or returns no data: **0 credits** (falls back to `mixed_companies/search` data for free)
+
 ### ⚡ 7-Day Apollo Cache
 - Apollo enrichment results are cached locally in `stage2_cache.json` for 7 days
 - On each run, accounts already enriched within the last 7 days are loaded instantly — only new accounts go to Apollo
@@ -195,6 +210,13 @@ layer, not a dependency.
 
 For each Tier A Strategic account, Claude defines the ideal buying committee
 using the full Apollo context (tech stack, job postings, funding, employees).
+
+### ⚡ 7-Day Buying Committee Cache
+- Stage 3a results are cached locally in `stage3a_cache.json` for 7 days
+- On each run, accounts already processed within the last 7 days are loaded instantly — only new accounts go to Claude
+- Cache status (⚡ From cache / ✨ New to Claude / Total) shown before the Stage 3a button
+- Cache key is company name (lowercased/stripped)
+- Cache entries expire automatically after 7 days
 
 ### Buying Committee Structure
 | Role | Type | Priority |
@@ -252,11 +274,28 @@ If title search returns no verified leads after unlock and validation, a second 
 | Warm | `director`, `manager` |
 | Cold | `manager`, `senior` |
 
+### No Buying Committee Fallback
+If Stage 3a returned an empty buying committee for an account, Stage 3b runs a title-based fallback search instead of skipping the account:
+- Hot pass: searches using `FALLBACK_HOT_TITLES` (CEO, CTO, CFO, CIO, CMO, CDO, COO, Director General, Co-Founder, Founder, etc.)
+- Warm pass: searches using `FALLBACK_WARM_TITLES` (Director, VP, Head of, Managing Director, Engineering Manager, Product Manager, etc.)
+- Uses the same `search_people` flow — q_organization_name first, domain fallback, unlock + domain validation
+- Seniority filter is NOT used — Apollo seniority data is unreliable for Iberian accounts
+
+### APOLLO TOKEN CONSUMPTION
+- **`people/match`** — **1 Apollo credit per unlock attempt**, regardless of whether the lead passes domain validation
+- Only candidates with `has_email: true` in the search result are unlocked — contacts with no known email are skipped before any credit is spent
+- Per-run hard cap: **50 unlock credits** enforced at two levels — between accounts and within a single account's persona loop
+- Credits tracked per account (`unlock_credits` field) and for the full run (`s3_run_credits`)
+
 ### Lead Unlock & Validation
 - Every candidate found is unlocked via Apollo's `people/match` endpoint to reveal name and email
 - Leads with no name after unlock are discarded
-- Leads whose email domain does not match the company domain are discarded — prevents stale or incorrectly associated contacts from entering the pipeline
-- If company domain is unknown, domain validation is skipped
+- Email domain validation is layered: if domain is known AND email is present, email domain must match company domain — mismatch → discard. If domain is unknown OR no email, falls back to `employment_history[0].organization_name` cross-check — if employer name doesn't match the target company, lead is discarded. This ensures validation always runs, even when domain is unavailable.
+- Only candidates with `has_email: true` in the Apollo search result are considered for unlock — contacts with no known email are skipped before any credit is spent
+- Leads where `employment_history[0].current == False` after unlock are discarded — prevents ex-employees from entering the pipeline
+- Stage 3b people search uses the Apollo-matched company name (`apollo_name_used`) from Stage 2, not the original AE-uploaded name — ensures correct entity matching in Apollo (e.g. `DEXTools` instead of `Dex Tools`)
+- LinkedIn URLs where the slug matches the company name are discarded — catches Apollo data errors where a company page URL is stored against a person record
+- A per-run credit cap of 50 unlock credits is enforced at two levels: (1) between accounts — if cap is reached, remaining accounts are skipped with a warning; (2) within a single account's persona loop — if cap is reached mid-account, remaining personas are skipped. This prevents a single poorly-indexed account from consuming the entire budget.
 
 ### Apollo Credit Tracking (Stage 3b)
 - Every `people/match` (unlock) call costs 1 Apollo credit — counted even when the lead fails domain validation

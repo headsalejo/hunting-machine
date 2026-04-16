@@ -21,9 +21,11 @@ CLAUDE_MODEL        = "claude-sonnet-4-6"
 BATCH_SIZE          = 10
 APOLLO_MIN_SCORE    = 28
 APOLLO_DELAY        = 0.6
+S3B_CREDIT_CAP      = 50
 CACHE_TTL_DAYS      = 7
 CACHE_FILE          = os.path.join(os.path.dirname(__file__), "stage1_cache.json")
 CACHE_FILE_S2       = os.path.join(os.path.dirname(__file__), "stage2_cache.json")
+CACHE_FILE_S3A      = os.path.join(os.path.dirname(__file__), "stage3a_cache.json")
 CACHE_FILE_PF       = os.path.join(os.path.dirname(__file__), "prefilter_cache.json")
 
 SALESFORCE_KW   = {"salesforce","sales cloud","service cloud","marketing cloud",
@@ -33,6 +35,19 @@ COMPETITOR_KW   = {"dynamics","microsoft dynamics","hubspot","sap crm","zoho","f
 CRM_HIRING_KW   = {"salesforce","crm","sales cloud","service cloud",
                    "marketing cloud","data cloud","agentforce"}
 TIER_ORDER      = {"A Strategic":0,"B Prime":1,"C Monitor":2,"Low Priority":3,"Remove":4}
+
+FALLBACK_HOT_TITLES  = ["CEO", "CFO", "CIO", "CMO", "CDO", "COO", "CTO",
+                         "Director General", "Directora General", "Group CEO",
+                         "Chief Executive", "Chief Financial", "Chief Information",
+                         "Chief Digital", "Chief Data", "Chief Marketing",
+                         "Chief Commercial", "Chief Operating", "Chief Technology",
+                         "Co-Founder", "Founder", "Owner", "Partner"]
+FALLBACK_WARM_TITLES = ["Director", "Directora", "VP", "Vice President",
+                         "Head of", "Responsable de", "Digital Director",
+                         "Sales Director", "Marketing Director", "IT Director",
+                         "eCommerce Director", "CRM Director", "Operations Director",
+                         "Logistics Director", "Financial Director", "Engineering Manager",
+                         "Product Manager", "Managing Director"]
 
 # ── Stage 1 cache ─────────────────────────────────────────────────────────────
 def _cache_key(company: str) -> str:
@@ -108,6 +123,35 @@ def save_stage2_cache(cache: dict):
     except Exception:
         pass
 
+# ── Stage 3a cache ─────────────────────────────────────────────────────────────
+def load_stage3a_cache() -> dict:
+    if not os.path.exists(CACHE_FILE_S3A):
+        return {}
+    try:
+        with open(CACHE_FILE_S3A, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=CACHE_TTL_DAYS)
+        valid = {}
+        for k, v in raw.items():
+            try:
+                cached_at = datetime.fromisoformat(v["cached_at"])
+                if cached_at.tzinfo is None:
+                    cached_at = cached_at.replace(tzinfo=timezone.utc)
+                if cached_at >= cutoff:
+                    valid[k] = v
+            except Exception:
+                pass
+        return valid
+    except Exception:
+        return {}
+
+def save_stage3a_cache(cache: dict):
+    try:
+        with open(CACHE_FILE_S3A, "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 # ── Pre-filter cache ──────────────────────────────────────────────────────────
 def load_prefilter_cache() -> dict:
     if not os.path.exists(CACHE_FILE_PF):
@@ -147,7 +191,9 @@ anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
 apollo_key    = os.getenv("APOLLO_API_KEY", "")
 
 st.sidebar.title("⚙️ Configuration")
-ae_name       = st.sidebar.text_input("AE Name (source tag)", placeholder="e.g. Alvaro")
+ae_name        = st.sidebar.text_input("AE Name (source tag)", placeholder="e.g. Alvaro")
+target_country = st.sidebar.text_input("🌍 Country/region priority", placeholder="e.g. Spain", help="Filters Apollo company search to this country — use when looking for a local entity (e.g. Axactor Spain vs Axactor Group)")
+single_account = st.sidebar.text_input("🎯 Run only for this account", placeholder="e.g. Axactor Spain", help="Runs the full pipeline for this single account only, bypassing the uploaded list")
 st.sidebar.markdown("---")
 st.sidebar.markdown("""
 **Pipeline**
@@ -163,17 +209,18 @@ st.sidebar.markdown("""
 
 # ── Session state ─────────────────────────────────────────────────────────────
 for k, default in [
-    ("stage",            0),
-    ("prefilter_done",   False),
-    ("prefilter_results",[]),
-    ("company_sources",  {}),
-    ("stage1_results",   []),
-    ("stage2_results",   []),
-    ("stage3a_results",  {}),
-    ("stage3_results",   []),
-    ("stage4_results",   []),
-    ("s2_run_credits",   0),
-    ("s3_run_credits",   0),
+    ("stage",                  0),
+    ("prefilter_done",         False),
+    ("prefilter_results",      []),
+    ("company_sources",        {}),
+    ("stage1_results",         []),
+    ("stage2_results",         []),
+    ("stage3a_results",        {}),
+    ("stage3_results",         []),
+    ("stage4_results",         []),
+    ("s2_run_credits",         0),
+    ("s3_run_credits",         0),
+    ("single_account_last_run",""),
 ]:
     if k not in st.session_state:
         st.session_state[k] = default
@@ -258,9 +305,10 @@ Return ONLY a JSON array, one object per company in the same order:
                 for c in company_list]
 
 
-def enrich_org(resolved, key):
+def enrich_org(resolved, key, country=""):
     """Try original name first, then Claude's canonical, then alt names — stop at first Apollo hit.
-    On hit: fetch full org intelligence via organizations/enrich using Apollo's own primary_domain."""
+    On hit: fetch full org intelligence via organizations/enrich using Apollo's own primary_domain.
+    If country is provided, filters the company search to that geography."""
     original  = resolved.get("company", "")
     canonical = resolved.get("canonical_name") or original
     alt_names = resolved.get("alt_names") or []
@@ -276,18 +324,27 @@ def enrich_org(resolved, key):
 
     for name in candidates:
         try:
-            data = apollo_post("mixed_companies/search", {
-                "q_organization_name": name,
-                "page": 1, "per_page": 1,
-            }, key)
+            payload = {"q_organization_name": name, "page": 1, "per_page": 1}
+            if country:
+                payload["organization_locations"] = [country]
+            data = apollo_post("mixed_companies/search", payload, key)
             orgs = data.get("accounts", []) or data.get("organizations", [])
             if not orgs:
                 continue
             account = orgs[0]
             account["_resolved_name"] = name
 
+            # Domain cross-validation — reject wrong entity before spending enrichment credit
+            apollo_domain = account.get("primary_domain") or account.get("domain", "")
+            claude_domain = resolved.get("domain", "")
+            if claude_domain and apollo_domain:
+                claude_root = claude_domain.split(".")[0].lower()
+                apollo_root = apollo_domain.split(".")[0].lower()
+                if claude_root not in apollo_root and apollo_root not in claude_root:
+                    continue  # domain mismatch — wrong entity, try next candidate
+
             # Fetch full intelligence record using Apollo's own domain
-            domain = account.get("primary_domain") or account.get("domain", "")
+            domain = apollo_domain
             if domain:
                 try:
                     enrich_data = apollo_post("organizations/enrich", {"domain": domain}, key)
@@ -352,21 +409,21 @@ def search_people(company_name, domain, titles, key, max_results=2, priority="Wa
                 pass
         return []
 
-    # Pass 1 — title-based search
-    for p in _run_search({"page":1, "per_page": max_results + 2, "person_titles": titles[:10]}):
-        if p.get("id") not in seen:
+    # Pass 1 — title-based search, only candidates with a known email (FIX 1)
+    for p in _run_search({"page":1, "per_page": max_results + 4, "person_titles": titles[:10]}):
+        if p.get("id") not in seen and p.get("has_email"):
             contacts.append(p)
             seen.add(p["id"])
 
-    # Pass 2 — seniority fallback if no results from titles
+    # Pass 2 — seniority fallback, same has_email filter (FIX 1)
     if not contacts:
         seniority = SENIORITY_BY_PRIORITY.get(priority, ["director"])
-        for p in _run_search({"page":1, "per_page": max_results + 2, "person_seniority": seniority}):
-            if p.get("id") not in seen:
+        for p in _run_search({"page":1, "per_page": max_results + 4, "person_seniority": seniority}):
+            if p.get("id") not in seen and p.get("has_email"):
                 contacts.append(p)
                 seen.add(p["id"])
 
-    # Unlock + domain-validate
+    # Unlock + validate
     verified, seen_names = [], set()
     unlock_credits = 0
     for p in contacts:
@@ -379,9 +436,30 @@ def search_people(company_name, domain, titles, key, max_results=2, priority="Wa
         name = unlocked.get("name") or ""
         if not name or name in seen_names:
             continue
-        email = unlocked.get("email") or ""
-        if not _email_domain_matches(email, domain):
+
+        # FIX 2: discard stale ex-employees
+        emp_history = unlocked.get("employment_history") or [{}]
+        if emp_history and emp_history[0].get("current") is False:
             continue
+
+        email = unlocked.get("email") or ""
+        if domain and email and not _email_domain_matches(email, domain):
+            continue  # domain known, email present, domain mismatch → discard
+        if not domain or not email:
+            # Domain unknown OR no email — fall back to employer name check
+            current_employer = emp_history[0].get("organization_name", "")
+            if current_employer and company_name.lower() not in current_employer.lower() \
+               and current_employer.lower() not in company_name.lower():
+                continue
+
+        # FIX 4: discard company-page LinkedIn URLs (slug matches company name)
+        linkedin = unlocked.get("linkedin_url") or ""
+        if linkedin:
+            slug = linkedin.rstrip("/").split("/")[-1].lower()
+            company_slug = company_name.lower().replace(" ", "-")
+            if slug == company_slug:
+                continue
+
         unlocked["_original"] = p
         verified.append(unlocked)
         seen_names.add(name)
@@ -755,7 +833,35 @@ uploaded_files = st.file_uploader(
     accept_multiple_files=True
 )
 
-if uploaded_files and not st.session_state.prefilter_done:
+_single = single_account.strip()
+
+# Reset pipeline state when the single-account target changes (or when switching
+# from batch mode to single-account mode mid-session).
+_PIPELINE_DEFAULTS = {
+    "stage": 0, "prefilter_done": False, "prefilter_results": [],
+    "company_sources": {}, "stage1_results": [], "stage2_results": [],
+    "stage3a_results": {}, "stage3_results": [], "stage4_results": [],
+    "s2_run_credits": 0, "s3_run_credits": 0,
+}
+if _single and _single != st.session_state.single_account_last_run:
+    for k, v in _PIPELINE_DEFAULTS.items():
+        st.session_state[k] = v
+    st.session_state.single_account_last_run = _single
+
+if _single and not st.session_state.prefilter_done:
+    # Single-account mode: bypass file upload entirely
+    company_sources = {_single: ae_name.strip() or "manual"}
+    all_companies   = [_single]
+    st.caption(f"🎯 Single-account mode: running full pipeline for **{_single}**")
+    if not (anthropic_key and anthropic_key.startswith("sk-ant-")):
+        st.warning("Anthropic API key not found in .env file.")
+    elif st.button("🚀 Run Full Pipeline", type="primary"):
+        st.session_state.prefilter_results = [{"company": _single, "decision": "keep", "detail": "Single-account mode — pre-filter bypassed."}]
+        st.session_state.company_sources   = company_sources
+        st.session_state.prefilter_done    = True
+        st.rerun()
+
+elif uploaded_files and not st.session_state.prefilter_done:
     company_sources = {}
     for f in uploaded_files:
         src = ae_name.strip() or f.name.rsplit(".",1)[0]
@@ -839,7 +945,7 @@ if st.session_state.prefilter_done and st.session_state.stage == 0:
         "AE":        cs.get(r["company"], ""),
         "Reasoning": r.get("detail", ""),
     } for r in kept])
-    st.dataframe(keep_df, use_container_width=True, hide_index=True)
+    st.dataframe(keep_df, width='stretch', hide_index=True)
 
     restored_companies = []
     if discarded:
@@ -861,7 +967,7 @@ if st.session_state.prefilter_done and st.session_state.stage == 0:
             edited_discard = st.data_editor(
                 discard_df,
                 column_config={"↩ Restore": st.column_config.CheckboxColumn("↩ Restore", default=False)},
-                use_container_width=True,
+                width='stretch',
                 hide_index=True,
                 key="restore_editor",
                 disabled=["Company","AE","Reason","Detail"],
@@ -940,12 +1046,15 @@ if st.session_state.stage == 1 and st.session_state.stage1_results:
 
     s1 = st.session_state.stage1_results
     cache_now = load_stage1_cache()
+    _in_single_mode = bool(st.session_state.single_account_last_run)
+    if _in_single_mode:
+        st.caption("🎯 Single-account mode — Override Tier defaulted to A Strategic so the full pipeline runs regardless of score.")
     review_df = pd.DataFrame([{
         "Company":        r.get("company",""),
         "AE":             r.get("ae_source",""),
         "Score":          int(r.get("score",0)),
         "Claude Tier":    r.get("tier",""),
-        "Override Tier":  r.get("tier","") if r.get("score",0) >= APOLLO_MIN_SCORE else "C Monitor",
+        "Override Tier":  "A Strategic" if _in_single_mode else (r.get("tier","") if r.get("score",0) >= APOLLO_MIN_SCORE else "C Monitor"),
         "Industry":       r.get("industry",""),
         "Account Type":   r.get("account_type_hint",""),
         "Triggers":       ", ".join(r.get("trigger_events",[])),
@@ -974,7 +1083,7 @@ if st.session_state.stage == 1 and st.session_state.stage1_results:
             "Narrative": st.column_config.TextColumn("Narrative", width="large"),
             "Triggers":  st.column_config.TextColumn("Triggers", width="medium"),
         },
-        use_container_width=True,
+        width='stretch',
         hide_index=True,
         key="review_editor",
     )
@@ -1045,7 +1154,7 @@ if st.session_state.stage == 1 and st.session_state.stage1_results:
                 resolved   = resolved_map.get(row["Company"],
                                  {"company": row["Company"], "canonical_name": row["Company"],
                                   "domain": "", "alt_names": []})
-                apollo_org = enrich_org(resolved, apollo_key)
+                apollo_org = enrich_org(resolved, apollo_key, country=target_country.strip())
                 scoring    = score_apollo(row["Score"], apollo_org)
 
                 final_tier = score_to_tier(scoring["final_score"])
@@ -1111,9 +1220,11 @@ if st.session_state.stage >= 2 and st.session_state.stage2_results:
     )
 
     s2 = st.session_state.stage2_results
+    _single_mode = bool(st.session_state.single_account_last_run)
 
     # ── Metrics ───────────────────────────────────────────────────────────────
-    tier_a    = [r for r in s2 if r["final_tier"] == "A Strategic"]
+    # In single-account mode all accounts proceed to 3a/3b regardless of tier.
+    tier_a    = s2 if _single_mode else [r for r in s2 if r["final_tier"] == "A Strategic"]
     tier_b    = [r for r in s2 if r["final_tier"] == "B Prime"]
     promoted  = [r for r in s2 if r["final_tier"] != r["stage1_tier"]]
     eb        = [r for r in s2 if "Existing" in r.get("account_type","")]
@@ -1361,29 +1472,55 @@ if st.session_state.stage >= 2 and st.session_state.stage2_results:
         names = " · ".join(r["company"] for r in promoted[:3])
         st.warning(f"⬆ **{len(promoted)} account(s) promoted by Apollo:** {names}")
 
-    st.info(f"👥 **Ready for Lead Intelligence** — "
-            f"**{len(tier_a)} Tier A Strategic accounts** proceed to Stage 3a + 3b.")
+    if _single_mode:
+        st.info(f"👥 **Ready for Lead Intelligence** — single-account mode: all {len(tier_a)} account(s) proceed to Stage 3a + 3b regardless of tier.")
+    else:
+        st.info(f"👥 **Ready for Lead Intelligence** — "
+                f"**{len(tier_a)} Tier A Strategic accounts** proceed to Stage 3a + 3b.")
 
     if st.session_state.stage == 2:
         if not tier_a:
-            st.error("No Tier A Strategic accounts found. Review overrides above.")
+            st.error("No accounts available for Stage 3a. Review overrides above." if _single_mode else "No Tier A Strategic accounts found. Review overrides above.")
 
         # ── Step 1: Define Buying Committees (3a) ─────────────────────────────
         elif not st.session_state.stage3a_results:
             st.markdown("")
+            s3a_cache   = load_stage3a_cache()
+            cached_s3a  = [a for a in tier_a if _cache_key(a["company"]) in s3a_cache]
+            new_s3a     = [a for a in tier_a if _cache_key(a["company"]) not in s3a_cache]
+            col_s3a_c, col_s3a_n, col_s3a_t = st.columns(3)
+            col_s3a_c.metric("⚡ From cache", len(cached_s3a))
+            col_s3a_n.metric("✨ New to Claude", len(new_s3a))
+            col_s3a_t.metric("Total", len(tier_a))
+            if cached_s3a:
+                st.caption(f"✅ {len(cached_s3a)} account(s) have buying committees cached in the last {CACHE_TTL_DAYS} days — only {len(new_s3a)} new accounts will go to Claude.")
             if not anthropic_key:
                 st.warning("Enter your Anthropic API key in the sidebar to proceed.")
             elif st.button("🧠 Define Buying Committees — Stage 3a", type="primary"):
                 progress = st.progress(0)
                 status   = st.empty()
-                status.text("🧠 Claude defining buying committees...")
-                batches  = [tier_a[i:i+BATCH_SIZE] for i in range(0, len(tier_a), BATCH_SIZE)]
                 personas = []
-                for i, batch in enumerate(batches):
-                    personas.extend(claude_stage3a(batch, anthropic_key))
-                    progress.progress((i+1)/len(batches))
+
+                # Serve cached accounts instantly
+                for a in cached_s3a:
+                    personas.append(s3a_cache[_cache_key(a["company"])])
+
+                # Run Claude only for new accounts
+                if new_s3a:
+                    status.text("🧠 Claude defining buying committees...")
+                    batches = [new_s3a[i:i+BATCH_SIZE] for i in range(0, len(new_s3a), BATCH_SIZE)]
+                    for i, batch in enumerate(batches):
+                        results = claude_stage3a(batch, anthropic_key)
+                        for r in results:
+                            r["cached_at"] = datetime.now(timezone.utc).isoformat()
+                            s3a_cache[_cache_key(r["company"])] = r
+                        personas.extend(results)
+                        progress.progress((len(cached_s3a) + sum(len(batches[j]) for j in range(i+1))) / len(tier_a))
+                    save_stage3a_cache(s3a_cache)
+
+                progress.progress(1.0)
                 st.session_state.stage3a_results = {p["company"]: p for p in personas}
-                status.success(f"✅ Buying committees defined for {len(personas)} accounts.")
+                status.success(f"✅ Buying committees defined — {len(cached_s3a)} from cache, {len(new_s3a)} freshly scored.")
                 st.rerun()
 
         # ── Step 2: Review gate + Run People Search (3b) ──────────────────────
@@ -1490,16 +1627,55 @@ if st.session_state.stage >= 2 and st.session_state.stage2_results:
                     all_leads, seen_names = [], set()
                     acct_unlock_credits = 0
 
-                    for persona in committee:
+                    # If Stage 3a returned no committee, use fallback title search
+                    search_personas = committee if committee else [
+                        {"priority": "Hot",  "role_type": "Power Lead",   "search_titles": FALLBACK_HOT_TITLES},
+                        {"priority": "Warm", "role_type": "Sponsor Lead", "search_titles": FALLBACK_WARM_TITLES},
+                    ]
+
+                    # FIX 3: use Apollo-matched name for people search, not AE-uploaded name
+                    search_name = account.get("apollo_name_used") or account["company"]
+
+                    # FIX 5: check credit cap before starting this account
+                    if s3_run_credits >= S3B_CREDIT_CAP:
+                        status.warning(f"⚠️ Credit cap of {S3B_CREDIT_CAP} reached — stopping Stage 3b. {len(tier_a) - i} account(s) skipped.")
+                        break
+
+                    # Pre-check: does Apollo have any people for this account? (free call)
+                    try:
+                        probe = apollo_post("mixed_people/api_search", {
+                            "q_organization_name": search_name, "page": 1, "per_page": 1
+                        }, apollo_key)
+                        if not probe.get("people"):
+                            st.caption(f"⚠️ {account['company']} — no people indexed in Apollo, skipping.")
+                            s3.append({**account, "buying_committee": committee,
+                                        "outreach_angle": p_data.get("outreach_angle",""),
+                                        "why_now": p_data.get("why_now",""),
+                                        "value_pillar": p_data.get("value_pillar",""),
+                                        "leads": [], "unlock_credits": 0})
+                            progress.progress((i+1)/len(tier_a))
+                            continue
+                    except Exception:
+                        pass  # probe failed — proceed with persona searches anyway
+
+                    empty_streak = 0
+                    for persona in search_personas:
                         titles = persona.get("search_titles", [])
                         if not titles:
                             continue
+                        # Consecutive-empty guard: 3 empty personas in a row → stop this account
+                        if empty_streak >= 3:
+                            break
+                        # Intra-account credit cap: stop persona loop if cap reached mid-account
+                        if s3_run_credits + acct_unlock_credits >= S3B_CREDIT_CAP:
+                            break
                         people, unlock_credits = search_people(
-                            account["company"], account.get("domain",""),
+                            search_name, account.get("domain",""),
                             titles, apollo_key, max_results=2,
                             priority=persona.get("priority","Warm")
                         )
                         acct_unlock_credits += unlock_credits
+                        empty_streak = 0 if people else empty_streak + 1
                         for person in people:
                             name = person.get("name","")
                             if name and name not in seen_names:
