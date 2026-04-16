@@ -381,8 +381,12 @@ def _email_domain_matches(email, company_domain):
     email_domain = email.split("@")[-1].lower().strip()
     return email_domain == company_domain.lower().strip()
 
-def search_people(company_name, domain, titles, key, max_results=2, priority="Warm"):
-    contacts, seen = [], set()
+def search_people(company_name, domain, titles, key, max_results=2, priority="Warm", seen_ids=None):
+    # seen_ids shared across persona calls for the same account — prevents unlocking
+    # the same person twice when they appear in multiple persona search results
+    if seen_ids is None:
+        seen_ids = set()
+    contacts = []
 
     def _run_search(payload):
         """Try q_organization_name first, fall back to domain."""
@@ -403,19 +407,19 @@ def search_people(company_name, domain, titles, key, max_results=2, priority="Wa
                 pass
         return []
 
-    # Pass 1 — title-based search, only candidates with a known email (FIX 1)
-    for p in _run_search({"page":1, "per_page": max_results + 4, "person_titles": titles[:10]}):
-        if p.get("id") not in seen and p.get("has_email"):
+    # Pass 1 — title-based search, only candidates with a known email
+    for p in _run_search({"page":1, "per_page": max_results + 1, "person_titles": titles[:10]}):
+        if p.get("id") not in seen_ids and p.get("has_email"):
             contacts.append(p)
-            seen.add(p["id"])
+            seen_ids.add(p["id"])
 
-    # Pass 2 — seniority fallback, same has_email filter (FIX 1)
+    # Pass 2 — seniority fallback, same has_email filter
     if not contacts:
         seniority = SENIORITY_BY_PRIORITY.get(priority, ["director"])
-        for p in _run_search({"page":1, "per_page": max_results + 4, "person_seniority": seniority}):
-            if p.get("id") not in seen and p.get("has_email"):
+        for p in _run_search({"page":1, "per_page": max_results + 1, "person_seniority": seniority}):
+            if p.get("id") not in seen_ids and p.get("has_email"):
                 contacts.append(p)
-                seen.add(p["id"])
+                seen_ids.add(p["id"])
 
     # Unlock + validate
     verified, seen_names = [], set()
@@ -1627,101 +1631,131 @@ if st.session_state.stage >= 2 and st.session_state.stage2_results:
             elif st.button("👥 Run People Search — Stage 3b", type="primary"):
                 progress = st.progress(0)
                 status   = st.empty()
-                s3             = []
                 s3_run_credits = 0
 
-                for i, account in enumerate(tier_a):
-                    status.text(f"👥 Apollo finding leads {i+1}/{len(tier_a)}: {account['company']}...")
-                    p_data    = personas_map.get(account["company"], {})
+                # ── Pre-build per-account state ───────────────────────────────
+                # Separating state from the loop allows the three-pass sweep to
+                # accumulate leads across passes without re-initialising per account.
+                acct_state = {}
+                for acct in tier_a:
+                    p_data    = personas_map.get(acct["company"], {})
                     committee = p_data.get("buying_committee", [])
-                    all_leads, seen_names = [], set()
-                    acct_unlock_credits = 0
+                    acct_state[acct["company"]] = {
+                        "p_data":          p_data,
+                        "committee":       committee,
+                        "search_personas": committee if committee else [
+                            {"priority": "Hot",  "role_type": "Power Lead",   "search_titles": FALLBACK_HOT_TITLES},
+                            {"priority": "Warm", "role_type": "Sponsor Lead", "search_titles": FALLBACK_WARM_TITLES},
+                        ],
+                        "search_name":     acct.get("apollo_name_used") or acct["company"],
+                        "all_leads":       [],
+                        "seen_names":      set(),
+                        "seen_ids":        set(),   # shared across personas — prevents duplicate unlocks
+                        "acct_credits":    0,
+                        "probed":          False,
+                        "has_people":      True,
+                    }
 
-                    # If Stage 3a returned no committee, use fallback title search
-                    search_personas = committee if committee else [
-                        {"priority": "Hot",  "role_type": "Power Lead",   "search_titles": FALLBACK_HOT_TITLES},
-                        {"priority": "Warm", "role_type": "Sponsor Lead", "search_titles": FALLBACK_WARM_TITLES},
-                    ]
+                # ── Three-pass priority sweep ─────────────────────────────────
+                # Hot pass → all accounts first, then Warm, then Cold.
+                # Every account gets its most important leads before any account
+                # gets its secondary leads. Credit cap stops the sweep globally
+                # but never skips an account that hasn't been visited yet in
+                # the current pass.
+                total_steps = len(tier_a) * 3
+                step        = 0
+                cap_reached = False
 
-                    # FIX 3: use Apollo-matched name for people search, not AE-uploaded name
-                    search_name = account.get("apollo_name_used") or account["company"]
-
-                    # FIX 5: check credit cap before starting this account
-                    if s3_run_credits >= S3B_CREDIT_CAP:
-                        status.warning(f"⚠️ Credit cap of {S3B_CREDIT_CAP} reached — stopping Stage 3b. {len(tier_a) - i} account(s) skipped.")
+                for priority_pass in ["Hot", "Warm", "Cold"]:
+                    if cap_reached:
                         break
+                    status.text(f"👥 {priority_pass} pass — scanning {len(tier_a)} accounts...")
+                    for acct in tier_a:
+                        step += 1
+                        progress.progress(step / total_steps)
+                        st_a = acct_state[acct["company"]]
 
-                    # Pre-check: does Apollo have any people for this account? (free call)
-                    try:
-                        probe = apollo_post("mixed_people/api_search", {
-                            "q_organization_name": search_name, "page": 1, "per_page": 1
-                        }, apollo_key)
-                        if not probe.get("people"):
-                            st.caption(f"⚠️ {account['company']} — no people indexed in Apollo, skipping.")
-                            s3.append({**account, "buying_committee": committee,
-                                        "outreach_angle": p_data.get("outreach_angle",""),
-                                        "why_now": p_data.get("why_now",""),
-                                        "value_pillar": p_data.get("value_pillar",""),
-                                        "leads": [], "unlock_credits": 0})
-                            progress.progress((i+1)/len(tier_a))
-                            continue
-                    except Exception:
-                        pass  # probe failed — proceed with persona searches anyway
-
-                    empty_streak = 0
-                    for persona in search_personas:
-                        titles = persona.get("search_titles", [])
-                        if not titles:
-                            continue
-                        # Consecutive-empty guard: 3 empty personas in a row → stop this account
-                        if empty_streak >= 3:
+                        # Global cap check
+                        if s3_run_credits >= S3B_CREDIT_CAP:
+                            status.warning(f"⚠️ Credit cap of {S3B_CREDIT_CAP} reached after {priority_pass} pass.")
+                            cap_reached = True
                             break
-                        # Intra-account credit cap: stop persona loop if cap reached mid-account
-                        if s3_run_credits + acct_unlock_credits >= S3B_CREDIT_CAP:
-                            break
-                        people, unlock_credits = search_people(
-                            search_name, account.get("domain",""),
-                            titles, apollo_key, max_results=2,
-                            priority=persona.get("priority","Warm")
-                        )
-                        acct_unlock_credits += unlock_credits
-                        empty_streak = 0 if people else empty_streak + 1
-                        for person in people:
-                            name = person.get("name","")
-                            if name and name not in seen_names:
-                                new_hire, hire_date = is_new_hire(person)
-                                all_leads.append({
-                                    "name":         name,
-                                    "title":        person.get("title",""),
-                                    "email":        person.get("email",""),
-                                    "email_status": person.get("email_status",""),
-                                    "linkedin":     person.get("linkedin_url",""),
-                                    "seniority":    person.get("seniority",""),
-                                    "priority":     persona.get("priority","Warm"),
-                                    "role_type":    persona.get("role_type",""),
-                                    "new_hire":     new_hire,
-                                    "hire_date":    hire_date or "",
-                                })
-                                seen_names.add(name)
 
-                    all_leads.sort(key=lambda l: {"Hot":0,"Warm":1,"Cold":2}.get(l.get("priority","Cold"),2))
-                    s3_run_credits += acct_unlock_credits
+                        # Pre-probe once per account (first pass only, free call)
+                        if not st_a["probed"]:
+                            st_a["probed"] = True
+                            try:
+                                probe = apollo_post("mixed_people/api_search", {
+                                    "q_organization_name": st_a["search_name"], "page": 1, "per_page": 1
+                                }, apollo_key)
+                                if not probe.get("people"):
+                                    st_a["has_people"] = False
+                                    st.caption(f"⚠️ {acct['company']} — no people indexed in Apollo, skipping.")
+                            except Exception:
+                                pass  # probe failed — proceed anyway
 
+                        if not st_a["has_people"]:
+                            continue
+
+                        # Search only personas matching this pass's priority
+                        for persona in st_a["search_personas"]:
+                            if persona.get("priority") != priority_pass:
+                                continue
+                            titles = persona.get("search_titles", [])
+                            if not titles:
+                                continue
+                            if s3_run_credits >= S3B_CREDIT_CAP:
+                                cap_reached = True
+                                break
+
+                            people, unlock_credits = search_people(
+                                st_a["search_name"], acct.get("domain", ""),
+                                titles, apollo_key, max_results=2,
+                                priority=priority_pass,
+                                seen_ids=st_a["seen_ids"],
+                            )
+                            s3_run_credits        += unlock_credits
+                            st_a["acct_credits"]  += unlock_credits
+
+                            for person in people:
+                                name = person.get("name", "")
+                                if name and name not in st_a["seen_names"]:
+                                    new_hire, hire_date = is_new_hire(person)
+                                    st_a["all_leads"].append({
+                                        "name":         name,
+                                        "title":        person.get("title", ""),
+                                        "email":        person.get("email", ""),
+                                        "email_status": person.get("email_status", ""),
+                                        "linkedin":     person.get("linkedin_url", ""),
+                                        "seniority":    person.get("seniority", ""),
+                                        "priority":     priority_pass,
+                                        "role_type":    persona.get("role_type", ""),
+                                        "new_hire":     new_hire,
+                                        "hire_date":    hire_date or "",
+                                    })
+                                    st_a["seen_names"].add(name)
+
+                # ── Build final s3 results from accumulated state ─────────────
+                s3 = []
+                for acct in tier_a:
+                    st_a   = acct_state[acct["company"]]
+                    p_data = st_a["p_data"]
+                    leads  = sorted(st_a["all_leads"],
+                                    key=lambda l: {"Hot":0,"Warm":1,"Cold":2}.get(l.get("priority","Cold"), 2))
                     s3.append({
-                        **account,
-                        "buying_committee":  committee,
-                        "outreach_angle":    p_data.get("outreach_angle",""),
-                        "why_now":           p_data.get("why_now",""),
-                        "value_pillar":      p_data.get("value_pillar",""),
-                        "leads":             all_leads,
-                        "unlock_credits":    acct_unlock_credits,
+                        **acct,
+                        "buying_committee": st_a["committee"],
+                        "outreach_angle":   p_data.get("outreach_angle", ""),
+                        "why_now":          p_data.get("why_now", ""),
+                        "value_pillar":     p_data.get("value_pillar", ""),
+                        "leads":            leads,
+                        "unlock_credits":   st_a["acct_credits"],
                     })
-                    progress.progress((i+1)/len(tier_a))
 
-                s3.sort(key=lambda x: x.get("final_score",0), reverse=True)
-                st.session_state.stage3_results  = s3
-                st.session_state.stage           = 3
-                st.session_state.s3_run_credits  = s3_run_credits
+                s3.sort(key=lambda x: x.get("final_score", 0), reverse=True)
+                st.session_state.stage3_results = s3
+                st.session_state.stage          = 3
+                st.session_state.s3_run_credits = s3_run_credits
                 total_leads = sum(len(r["leads"]) for r in s3)
                 status.success(f"✅ Lead intelligence complete — {total_leads} leads found across {len(s3)} accounts · 🔋 {s3_run_credits} Apollo unlock credits used.")
                 st.rerun()

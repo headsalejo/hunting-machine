@@ -260,10 +260,18 @@ using the full Apollo context (tech stack, job postings, funding, employees).
 
 Apollo people search runs against the buying committee personas defined in Stage 3a.
 
-### Search Priorities
-1. Search for **Hot Leads** first (C-Level, economic buyer, technical evaluator)
-2. Search for **Warm Leads** second (sponsor level, CRM/digital owners)
-3. Only search for **Cold Leads** if Hot and Warm are insufficient
+### Three-Pass Priority Sweep
+Stage 3b processes all accounts in three global passes rather than exhausting each account before moving to the next. This prevents early accounts from consuming the entire credit budget and guarantees every account in the list receives at minimum a Hot-pass attempt.
+
+| Pass | Personas searched | Effect |
+|------|------------------|--------|
+| Pass 1 — Hot | C-Level, economic buyer, technical evaluator | Full list scanned for highest-value leads first |
+| Pass 2 — Warm | Director, CRM/digital owner, sponsor | Full list scanned if cap not yet reached |
+| Pass 3 — Cold | Manager, operational influencer | Full list scanned last — skipped entirely if cap reached |
+
+**Per-page buffer**: `search_people` fetches `max_results + 1` candidates per Apollo call (was `max_results + 4`) — tighter buffer reduces unlock exposure while still providing one overflow candidate for validation headroom.
+
+**Shared deduplication**: A `seen_ids` set is shared across all persona calls within the same account. A person that matches multiple personas is only unlocked once — no duplicate credit spend.
 
 ### Title Search Strategy
 - Claude generates 8–10 title variants per persona covering English and Spanish versions, abbreviations (CIO, CDO, CTO), and common Iberian variants
@@ -300,7 +308,7 @@ If Stage 3a returned an empty buying committee for an account, Stage 3b runs a t
 - Leads where `employment_history[0].current == False` after unlock are discarded — prevents ex-employees from entering the pipeline
 - Stage 3b people search uses the Apollo-matched company name (`apollo_name_used`) from Stage 2, not the original AE-uploaded name — ensures correct entity matching in Apollo (e.g. `DEXTools` instead of `Dex Tools`)
 - LinkedIn URLs where the slug matches the company name are discarded — catches Apollo data errors where a company page URL is stored against a person record
-- A per-run credit cap of 50 unlock credits is enforced at two levels: (1) between accounts — if cap is reached, remaining accounts are skipped with a warning; (2) within a single account's persona loop — if cap is reached mid-account, remaining personas are skipped. This prevents a single poorly-indexed account from consuming the entire budget.
+- The 50-credit cap is enforced at two levels within the three-pass sweep: (1) between accounts in each pass — if cap is reached, the current pass stops and subsequent passes are skipped; (2) within a single account's persona loop — if cap is reached mid-account, remaining personas for that account are skipped. The three-pass structure ensures the cap is spread fairly across the full account list rather than front-loading credits on the first few accounts.
 
 ### Apollo Credit Tracking (Stage 3b)
 - Every `people/match` (unlock) call costs 1 Apollo credit — counted even when the lead fails domain validation
