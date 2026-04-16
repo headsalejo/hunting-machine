@@ -325,7 +325,6 @@ For each confirmed Hot Lead, Claude generates:
 - A personalized 3-line opening for email / LinkedIn
 - A "why now" hook based on trigger events from Stages 1–2 and new hire flag from Stage 3b
 - A Salesforce value pillar mapped to their role and industry
-- A suggested sequence: LinkedIn connect → email → call
 
 ### Why Now Hooks (priority order)
 1. 🆕 New CxO hire at the account (highest urgency — "new broom" window)

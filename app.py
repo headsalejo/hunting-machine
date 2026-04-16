@@ -1,6 +1,6 @@
 """
 Hunting Machine — 4-Stage Account Intelligence Pipeline
-Claude Sonnet 4.6 + Apollo.io
+Claude Sonnet 4.6 (scoring/intelligence) + Claude Haiku 4.5 (pre-filter/name resolution) + Apollo.io
 """
 
 import streamlit as st
@@ -18,6 +18,7 @@ load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 CLAUDE_MODEL        = "claude-sonnet-4-6"
+CLAUDE_HAIKU_MODEL  = "claude-haiku-4-5-20251001"
 BATCH_SIZE          = 10
 APOLLO_MIN_SCORE    = 28
 APOLLO_DELAY        = 0.6
@@ -48,6 +49,15 @@ FALLBACK_WARM_TITLES = ["Director", "Directora", "VP", "Vice President",
                          "eCommerce Director", "CRM Director", "Operations Director",
                          "Logistics Director", "Financial Director", "Engineering Manager",
                          "Product Manager", "Managing Director"]
+
+# ── Anthropic client singleton (avoids re-instantiating the HTTP pool per call) ─
+_anthropic_clients: dict = {}
+
+def _get_client(key: str) -> anthropic.Anthropic:
+    if key not in _anthropic_clients:
+        _anthropic_clients[key] = anthropic.Anthropic(api_key=key)
+    return _anthropic_clients[key]
+
 
 # ── Stage 1 cache ─────────────────────────────────────────────────────────────
 def _cache_key(company: str) -> str:
@@ -184,7 +194,7 @@ def save_prefilter_cache(cache: dict):
 # ── Page setup ────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="Hunting Machine", page_icon="🎯", layout="wide")
 st.title("🎯 Hunting Machine")
-st.markdown("4-stage account intelligence · **Claude Sonnet 4.6** + **Apollo.io**")
+st.markdown("4-stage account intelligence · **Claude Sonnet 4.6** (scoring) + **Claude Haiku 4.5** (pre-filter/names) + **Apollo.io**")
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
@@ -278,28 +288,10 @@ def apollo_post(endpoint, payload, key):
 def claude_resolve_names(company_list, key):
     """Use Claude's semantic knowledge to resolve company names to their most likely Apollo-indexed form."""
     block = "\n".join(f"- {c}" for c in company_list)
-    prompt = f"""You are helping match company names to their Apollo.io database entries.
-
-For each company return:
-- canonical_name: the most likely name Apollo.io uses to index this company. This may be identical to the original name, or a known variant (e.g. without legal suffix, parent company name, common trade name). Do NOT translate to English — use whatever name Apollo most likely uses.
-- domain: primary web domain if you know it (e.g. lupa.es, mango.com) — empty string if unsure
-- alt_names: up to 2 additional name variants to try as fallbacks (e.g. with/without legal suffix, abbreviated name, parent brand)
-
-COMPANIES:
-{block}
-
-Examples of correct resolution:
-- "Lupa Supermercados" → canonical: "Lupa Supermercados", domain: "lupa.es", alt_names: ["Lupa"]
-- "Grupo Mahou San Miguel" → canonical: "Mahou San Miguel", domain: "mahou.es", alt_names: ["Mahou-San Miguel", "Grupo Mahou"]
-- "El Corte Inglés" → canonical: "El Corte Ingles", domain: "elcorteingles.es", alt_names: ["El Corte Inglés"]
-- "Clínica Baviera" → canonical: "Clinica Baviera", domain: "clinicabaviera.com", alt_names: ["Baviera"]
-
-Return ONLY a JSON array, one object per company in the same order:
-[{{"company":"","canonical_name":"","domain":"","alt_names":[]}}]"""
+    prompt = f"COMPANIES:\n{block}"
     try:
-        return call_claude(prompt,
-                           "You only respond with structured JSON arrays. Never wrap in markdown code blocks.",
-                           key, max_tokens=2048)
+        return call_claude(prompt, _RESOLVE_NAMES_SYSTEM, key,
+                           max_tokens=1024, cache_system=True, model=CLAUDE_HAIKU_MODEL)
     except Exception:
         return [{"company": c, "canonical_name": c, "domain": "", "alt_names": []}
                 for c in company_list]
@@ -555,30 +547,10 @@ def score_to_tier(score):
 
 def claude_prefilter(company_list, key):
     block = "\n".join(f"- {c}" for c in company_list)
-    prompt = f"""You are screening companies for a Salesforce enterprise sales team targeting Iberian (Spain and Portugal) accounts.
-
-For each company return "keep" or "discard" based ONLY on these criteria:
-
-DISCARD if ANY of the following apply:
-- Fewer than 600 employees (estimated)
-- No decision-making presence in Spain or Portugal
-- Industry with no CRM/SaaS transformation potential (e.g. public administration, micro-retail, NGO, agriculture)
-- Company name unrecognisable or clearly not an enterprise
-
-KEEP all others.
-
-COMPANIES:
-{block}
-
-Return ONLY a JSON array, one object per company in the same order:
-[{{"company":"","decision":"keep","reason":"","detail":""}}]
-
-For kept companies: reason and detail are empty strings.
-For discarded companies: reason = exact discard criteria phrase above, detail = brief factual context (one sentence)."""
+    prompt = f"COMPANIES:\n{block}"
     try:
-        return call_claude(prompt,
-                           "You only respond with structured JSON arrays. Never wrap in markdown code blocks.",
-                           key, max_tokens=4096)
+        return call_claude(prompt, _PREFILTER_SYSTEM, key,
+                           max_tokens=1024, cache_system=True, model=CLAUDE_HAIKU_MODEL)
     except Exception as e:
         return [{"company": c, "decision": "keep", "reason": "", "detail": str(e)}
                 for c in company_list]
@@ -607,27 +579,45 @@ def is_new_hire(person, months=6):
 # ════════════════════════════════════════════════════════════════════════════════
 # HELPERS — Claude
 # ════════════════════════════════════════════════════════════════════════════════
-def call_claude(prompt, system, key, max_tokens=4096):
-    client = anthropic.Anthropic(api_key=key)
-    msg = client.messages.create(
-        model=CLAUDE_MODEL, max_tokens=max_tokens, temperature=0,
-        system=system,
-        messages=[{"role":"user","content":prompt}]
-    )
-    raw = msg.content[0].text.strip()
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
-        raw = raw.strip()
-    return json.loads(raw)
 
-def claude_stage1(batch, key):
-    block = "\n".join(f"- {c}" for c in batch)
-    prompt = f"""Analyze these Spanish companies and score each one.
+# Static system prompts — defined once at module level so cache_control is effective
+# across all calls within the same session (Anthropic caches for 5 min of activity).
 
-COMPANIES:
-{block}
+_PREFILTER_SYSTEM = """You only respond with structured JSON arrays. Never wrap in markdown code blocks.
+You are screening companies for a Salesforce enterprise sales team targeting Iberian (Spain and Portugal) accounts.
+
+DISCARD if ANY of the following apply:
+- Fewer than 600 employees (estimated)
+- No decision-making presence in Spain or Portugal
+- Industry with no CRM/SaaS transformation potential (e.g. public administration, micro-retail, NGO, agriculture)
+- Company name unrecognisable or clearly not an enterprise
+
+KEEP all others.
+
+Return ONLY a JSON array, one object per company in the same order:
+[{"company":"","decision":"keep","reason":"","detail":""}]
+
+For kept companies: reason and detail are empty strings.
+For discarded companies: reason = exact discard criteria phrase above, detail = brief factual context (one sentence)."""
+
+_RESOLVE_NAMES_SYSTEM = """You only respond with structured JSON arrays. Never wrap in markdown code blocks.
+You are helping match company names to their Apollo.io database entries.
+
+For each company return:
+- canonical_name: the most likely name Apollo.io uses to index this company. This may be identical to the original name, or a known variant (e.g. without legal suffix, parent company name, common trade name). Do NOT translate to English — use whatever name Apollo most likely uses.
+- domain: primary web domain if you know it (e.g. lupa.es, mango.com) — empty string if unsure
+- alt_names: up to 2 additional name variants to try as fallbacks (e.g. with/without legal suffix, abbreviated name, parent brand)
+
+Examples of correct resolution:
+- "Lupa Supermercados" → canonical: "Lupa Supermercados", domain: "lupa.es", alt_names: ["Lupa"]
+- "Grupo Mahou San Miguel" → canonical: "Mahou San Miguel", domain: "mahou.es", alt_names: ["Mahou-San Miguel", "Grupo Mahou"]
+- "El Corte Inglés" → canonical: "El Corte Ingles", domain: "elcorteingles.es", alt_names: ["El Corte Inglés"]
+- "Clínica Baviera" → canonical: "Clinica Baviera", domain: "clinicabaviera.com", alt_names: ["Baviera"]
+
+Return ONLY a JSON array, one object per company in the same order:
+[{"company":"","canonical_name":"","domain":"","alt_names":[]}]"""
+
+_STAGE1_SYSTEM = """You only respond with structured JSON arrays. Never wrap in markdown code blocks.
 
 SCORING RULES (Score 1-50):
 1. Size: 600-1500 (+8), 1500-5000 (+12), 5000+ (+15)
@@ -645,11 +635,57 @@ TRIGGER EVENTS (note if detected — do NOT add extra points):
 TIERING: 35+ = A Strategic | 25-34 = B Prime | 15-24 = C Monitor | <15 = Low Priority
 
 Return ONLY a JSON array, one object per company in the same order:
-[{{"company":"","score":0,"tier":"","industry":"","account_type_hint":"Green Field or Existing Business","trigger_events":[],"narrative":""}}]"""
+[{"company":"","score":0,"tier":"","industry":"","account_type_hint":"Green Field or Existing Business","trigger_events":[],"narrative":""}]"""
+
+_STAGE3A_SYSTEM = """You only respond with structured JSON arrays. Never wrap in markdown code blocks.
+
+BUYING COMMITTEE RULES:
+- Hot Lead: C-Level with P&L or transformation ownership, or confirmed CRM decision maker
+- Warm Lead: Director/Manager owning CRM, Digital, Sales Ops, or Ecommerce
+- Cold Lead: Manager/analyst level — intel gathering only
+
+OUTREACH ANGLES by account type:
+- Green Field Transformation: Customer 360 unification, replace spreadsheets/point solutions
+- Green Field Displacement: competitor weaknesses, migration path, better ROI
+- Existing Business: expansion (more clouds, Agentforce, Data Cloud, AI)
+
+SEARCH TITLES RULES:
+- Provide 8-10 title variants per persona covering both English and Spanish versions
+- Include abbreviations (CIO, CDO, CTO), full titles, and common Iberian variants
+- Example for CIO persona: ["CIO", "Chief Information Officer", "Director de Sistemas", "Director de Tecnologia", "Director TI", "Director de Informatica", "IT Director", "Head of IT", "Chief Technology Officer", "CTO"]
+- Example for CRM persona: ["CRM Director", "Director CRM", "Sales Operations Director", "Director de Operaciones Comerciales", "Head of CRM", "CRM Manager", "Director de Ventas", "Sales Director", "Commercial Director", "Director Comercial"]
+- Broader is always better — Apollo will filter by relevance
+
+Return ONLY a JSON array, one object per company in the same order:
+[{"company":"","buying_committee":[{"persona":"","role_type":"Power Lead or Sponsor Lead","priority":"Hot or Warm or Cold","search_titles":[],"why":""}],"outreach_angle":"","why_now":"","value_pillar":""}]"""
+
+
+def call_claude(prompt, system, key, max_tokens=4096, cache_system=False, model=None):
+    client = _get_client(key)
+    _model = model or CLAUDE_MODEL
+    system_param = (
+        [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+        if cache_system else system
+    )
+    msg = client.messages.create(
+        model=_model, max_tokens=max_tokens, temperature=0,
+        system=system_param,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    raw = msg.content[0].text.strip()
+    if raw.startswith("```"):
+        raw = raw.split("```")[1]
+        if raw.startswith("json"):
+            raw = raw[4:]
+        raw = raw.strip()
+    return json.loads(raw)
+
+def claude_stage1(batch, key):
+    block = "\n".join(f"- {c}" for c in batch)
+    prompt = f"Analyze these Spanish companies and score each one.\n\nCOMPANIES:\n{block}"
     try:
-        return call_claude(prompt,
-                           "You only respond with structured JSON arrays. Never wrap in markdown code blocks.",
-                           key)
+        return call_claude(prompt, _STAGE1_SYSTEM, key,
+                           cache_system=True)
     except Exception as e:
         return [{"company":c,"score":0,"tier":"Low Priority","industry":"Unknown",
                  "account_type_hint":"Unknown","trigger_events":[],"narrative":str(e)}
@@ -667,42 +703,10 @@ Technologies: {', '.join(a.get('technologies',[])[:5]) or 'Unknown'}
 Active CRM Job Postings: {', '.join(a.get('crm_job_titles',[])) or 'None detected'}
 Trigger Events: {', '.join(a.get('trigger_events',[])) or 'None detected'}
 """
-    prompt = f"""For each account define the ideal buying committee and outreach strategy.
-
-{block}
-
-BUYING COMMITTEE RULES:
-- Hot Lead: C-Level with P&L or transformation ownership, or confirmed CRM decision maker
-- Warm Lead: Director/Manager owning CRM, Digital, Sales Ops, or Ecommerce
-- Cold Lead: Manager/analyst level — intel gathering only
-
-OUTREACH ANGLES by account type:
-- Green Field Transformation: Customer 360 unification, replace spreadsheets/point solutions
-- Green Field Displacement: competitor weaknesses, migration path, better ROI
-- Existing Business: expansion (more clouds, Agentforce, Data Cloud, AI)
-
-SEARCH TITLES RULES:
-- Provide 8–10 title variants per persona covering both English and Spanish versions
-- Include abbreviations (CIO, CDO, CTO), full titles, and common Iberian variants
-- Example for CIO persona: ["CIO", "Chief Information Officer", "Director de Sistemas", "Director de Tecnología", "Director TI", "Director de Informática", "IT Director", "Head of IT", "Chief Technology Officer", "CTO"]
-- Example for CRM persona: ["CRM Director", "Director CRM", "Sales Operations Director", "Director de Operaciones Comerciales", "Head of CRM", "CRM Manager", "Director de Ventas", "Sales Director", "Commercial Director", "Director Comercial"]
-- Broader is always better — Apollo will filter by relevance
-
-Return ONLY a JSON array, one object per company in the same order:
-[{{
-  "company":"",
-  "buying_committee":[
-    {{"persona":"","role_type":"Power Lead or Sponsor Lead","priority":"Hot or Warm or Cold",
-      "search_titles":[],"why":""}}
-  ],
-  "outreach_angle":"",
-  "why_now":"",
-  "value_pillar":""
-}}]"""
+    prompt = f"For each account define the ideal buying committee and outreach strategy.\n{block}"
     try:
-        return call_claude(prompt,
-                           "You only respond with structured JSON arrays. Never wrap in markdown code blocks.",
-                           key, max_tokens=8000)
+        return call_claude(prompt, _STAGE3A_SYSTEM, key,
+                           max_tokens=8000, cache_system=True)
     except Exception as e:
         return [{"company":a['company'],"buying_committee":[],"outreach_angle":"",
                  "why_now":str(e),"value_pillar":""}
