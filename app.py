@@ -4,9 +4,11 @@ Claude Sonnet 4.6 (scoring/intelligence) + Claude Haiku 4.5 (pre-filter/name res
 """
 
 import streamlit as st
+import streamlit.config as _st_internal_config
 import pandas as pd
 import json
 import io
+import re
 import time
 import requests
 import anthropic
@@ -15,6 +17,21 @@ from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 
 load_dotenv(os.path.join(os.path.dirname(__file__), ".env"))
+
+# ── Theme helpers ──────────────────────────────────────────────────────────────
+_CONFIG_PATH = os.path.join(os.path.dirname(__file__), ".streamlit", "config.toml")
+
+def _read_theme() -> str:
+    try:
+        txt = open(_CONFIG_PATH).read()
+        return "light" if 'base = "light"' in txt else "dark"
+    except Exception:
+        return "dark"
+
+def _write_theme(mode: str):
+    os.makedirs(os.path.dirname(_CONFIG_PATH), exist_ok=True)
+    with open(_CONFIG_PATH, "w") as f:
+        f.write(f'[theme]\nbase = "{mode}"\n')
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 CLAUDE_MODEL        = "claude-sonnet-4-6"
@@ -201,6 +218,23 @@ anthropic_key = os.getenv("ANTHROPIC_API_KEY", "")
 apollo_key    = os.getenv("APOLLO_API_KEY", "")
 
 st.sidebar.title("⚙️ Configuration")
+
+# ── Theme toggle ──────────────────────────────────────────────────────────────
+_current_theme = _read_theme()
+_theme_choice  = st.sidebar.segmented_control(
+    "Theme",
+    options=["🌙 Dark", "☀️ Light"],
+    default="🌙 Dark" if _current_theme == "dark" else "☀️ Light",
+    key="theme_toggle",
+)
+if _theme_choice is not None:
+    _chosen = "light" if _theme_choice == "☀️ Light" else "dark"
+    if _chosen != _current_theme:
+        _write_theme(_chosen)
+        _st_internal_config.set_option("theme.base", _chosen)
+        st.rerun()
+
+st.sidebar.markdown("---")
 ae_name        = st.sidebar.text_input("AE Name (source tag)", placeholder="e.g. Alvaro")
 target_country = st.sidebar.text_input("🌍 Country/region priority", placeholder="e.g. Spain", help="Filters Apollo company search to this country — use when looking for a local entity (e.g. Axactor Spain vs Axactor Group)")
 single_account = st.sidebar.text_input("🎯 Run only for this account", placeholder="e.g. Axactor Spain", help="Runs the full pipeline for this single account only, bypassing the uploaded list")
@@ -225,7 +259,10 @@ for k, default in [
     ("company_sources",        {}),
     ("stage1_results",         []),
     ("stage2_results",         []),
+    ("s1_overrides",           {}),
+    ("s1_selection",           []),
     ("stage3a_results",        {}),
+    ("stage3a_selected",       []),
     ("stage3_results",         []),
     ("stage4_results",         []),
     ("s2_run_credits",         0),
@@ -293,11 +330,15 @@ def claude_resolve_names(company_list, key, country=""):
     prompt = f"{country_line}COMPANIES:\n{block}"
     try:
         return call_claude(prompt, _RESOLVE_NAMES_SYSTEM, key,
-                           max_tokens=1024, cache_system=True)
+                           max_tokens=4096, cache_system=True)
     except Exception:
         return [{"company": c, "canonical_name": c, "domain": "", "alt_names": []}
                 for c in company_list]
 
+
+def _strip_diacritics(s):
+    import unicodedata
+    return "".join(c for c in unicodedata.normalize("NFD", s) if unicodedata.category(c) != "Mn")
 
 def enrich_org(resolved, key, country=""):
     """Try original name first, then Claude's canonical, then alt names — stop at first Apollo hit.
@@ -315,27 +356,40 @@ def enrich_org(resolved, key, country=""):
     for alt in alt_names:
         if alt and alt not in candidates:
             candidates.append(alt)
+    # Add diacritic-normalized versions to catch ñ/accent mismatches (e.g. Pañalon → Panalon)
+    for name in list(candidates):
+        normalized = _strip_diacritics(name)
+        if normalized not in candidates:
+            candidates.append(normalized)
 
     for name in candidates:
         try:
-            payload = {"q_organization_name": name, "page": 1, "per_page": 1}
+            payload = {"q_organization_name": name, "page": 1, "per_page": 20}
             if country:
                 payload["organization_locations"] = [country]
             data = apollo_post("mixed_companies/search", payload, key)
             orgs = data.get("accounts", []) or data.get("organizations", [])
             if not orgs:
                 continue
-            account = orgs[0]
-            account["_resolved_name"] = name
 
-            # Domain cross-validation — reject wrong entity before spending enrichment credit
-            apollo_domain = account.get("primary_domain") or account.get("domain", "")
+            # Domain cross-validation — scan ranked results, stop at first passing hit
             claude_domain = resolved.get("domain", "")
-            if claude_domain and apollo_domain:
-                claude_root = claude_domain.split(".")[0].lower()
-                apollo_root = apollo_domain.split(".")[0].lower()
-                if claude_root not in apollo_root and apollo_root not in claude_root:
-                    continue  # domain mismatch — wrong entity, try next candidate
+            account = None
+            for org in orgs:
+                apollo_domain = org.get("primary_domain") or org.get("domain", "")
+                if claude_domain and apollo_domain:
+                    claude_root = claude_domain.split(".")[0].lower()
+                    apollo_root = apollo_domain.split(".")[0].lower()
+                    if claude_root not in apollo_root and apollo_root not in claude_root:
+                        continue  # domain mismatch — wrong entity, try next rank
+                org["_resolved_name"] = name
+                account = org
+                break
+
+            if account is None:
+                continue  # all ranked results failed domain check — try next candidate name
+
+            apollo_domain = account.get("primary_domain") or account.get("domain", "")
 
             # Fetch full intelligence record using Apollo's own domain
             domain = apollo_domain
@@ -358,6 +412,19 @@ def enrich_org(resolved, key, country=""):
             return account
         except Exception:
             continue
+
+    # All name candidates failed — try direct domain enrichment as last resort
+    claude_domain = resolved.get("domain", "")
+    if claude_domain:
+        try:
+            enrich_data = apollo_post("organizations/enrich", {"domain": claude_domain}, key)
+            org = enrich_data.get("organization") or {}
+            if org:
+                org["_resolved_name"] = org.get("name") or original
+                org["_enrich_credits"] = 1
+                return org
+        except Exception:
+            pass
     return None
 
 SENIORITY_BY_PRIORITY = {
@@ -441,10 +508,8 @@ def search_people(company_name, domain, titles, key, max_results=2, priority="Wa
             continue
 
         email = unlocked.get("email") or ""
-        if domain and email and not _email_domain_matches(email, domain):
-            continue  # domain known, email present, domain mismatch → discard
-        if not domain or not email:
-            # Domain unknown OR no email — fall back to employer name check
+        if not email:
+            # No email — fall back to employer name check
             current_employer = emp_history[0].get("organization_name", "")
             if current_employer and company_name.lower() not in current_employer.lower() \
                and current_employer.lower() not in company_name.lower():
@@ -556,9 +621,9 @@ def claude_prefilter(company_list, key):
     prompt = f"COMPANIES:\n{block}"
     try:
         return call_claude(prompt, _PREFILTER_SYSTEM, key,
-                           max_tokens=1024, cache_system=True, model=CLAUDE_HAIKU_MODEL)
+                           max_tokens=4096, cache_system=True, model=CLAUDE_HAIKU_MODEL)
     except Exception as e:
-        return [{"company": c, "decision": "keep", "reason": "", "detail": str(e)}
+        return [{"company": c, "decision": "keep", "reason": "", "detail": str(e), "_error": True}
                 for c in company_list]
 
 
@@ -628,6 +693,7 @@ Return ONLY a JSON array, one object per company in the same order:
 [{"company":"","canonical_name":"","domain":"","alt_names":[]}]"""
 
 _STAGE1_SYSTEM = """You only respond with structured JSON arrays. Never wrap in markdown code blocks.
+All string values must be on a single line — do NOT include newline characters (\\n) inside any string value.
 
 SCORING RULES (Score 1-50):
 1. Size: 600-1500 (+8), 1500-5000 (+12), 5000+ (+15)
@@ -682,12 +748,21 @@ def call_claude(prompt, system, key, max_tokens=4096, cache_system=False, model=
         system=system_param,
         messages=[{"role": "user", "content": prompt}]
     )
+    # Truncated response = unterminated JSON string. Fail early with a clear message.
+    if msg.stop_reason == "max_tokens":
+        raise ValueError(
+            f"Claude response was truncated (max_tokens={max_tokens} hit). "
+            f"Response had {len(msg.content[0].text)} chars. Increase max_tokens or reduce batch size."
+        )
     raw = msg.content[0].text.strip()
     if raw.startswith("```"):
         raw = raw.split("```")[1]
         if raw.startswith("json"):
             raw = raw[4:]
         raw = raw.strip()
+    # Strip all ASCII control characters (0x00-0x1F) — bare control chars inside
+    # JSON string values are invalid and cause parse errors.
+    raw = re.sub(r'[\x00-\x1f]', ' ', raw)
     return json.loads(raw)
 
 def claude_stage1(batch, key):
@@ -695,10 +770,10 @@ def claude_stage1(batch, key):
     prompt = f"Analyze these Spanish companies and score each one.\n\nCOMPANIES:\n{block}"
     try:
         return call_claude(prompt, _STAGE1_SYSTEM, key,
-                           cache_system=True)
+                           max_tokens=16000, cache_system=True)
     except Exception as e:
         return [{"company":c,"score":0,"tier":"Low Priority","industry":"Unknown",
-                 "account_type_hint":"Unknown","trigger_events":[],"narrative":str(e)}
+                 "account_type_hint":"Unknown","trigger_events":[],"narrative":str(e),"_error":True}
                 for c in batch]
 
 def claude_stage3a(accounts, key):
@@ -719,7 +794,7 @@ Trigger Events: {', '.join(a.get('trigger_events',[])) or 'None detected'}
                            max_tokens=8000, cache_system=True)
     except Exception as e:
         return [{"company":a['company'],"buying_committee":[],"outreach_angle":"",
-                 "why_now":str(e),"value_pillar":""}
+                 "why_now":str(e),"value_pillar":"","_error":True}
                 for a in accounts]
 
 def claude_stage4(leads_data, key):
@@ -854,7 +929,8 @@ _single = single_account.strip()
 _PIPELINE_DEFAULTS = {
     "stage": 0, "prefilter_done": False, "prefilter_results": [],
     "company_sources": {}, "stage1_results": [], "stage2_results": [],
-    "stage3a_results": {}, "stage3_results": [], "stage4_results": [],
+    "s1_overrides": {}, "s1_selection": [],
+    "stage3a_results": {}, "stage3a_selected": [], "stage3_results": [], "stage4_results": [],
     "s2_run_credits": 0, "s3_run_credits": 0,
 }
 if _single and _single != st.session_state.single_account_last_run:
@@ -906,34 +982,44 @@ elif uploaded_files and not st.session_state.prefilter_done:
 
     if not (anthropic_key and anthropic_key.startswith("sk-ant-")):
         st.warning("Anthropic API key not found in .env file.")
-    elif st.button(btn_pf_label, type="primary"):
-        pf_cache = load_prefilter_cache()
-        pf = []
+    else:
+        _col_pf_run, _col_pf_force = st.columns([3, 2])
+        with _col_pf_run:
+            _pf_run = st.button(btn_pf_label, type="primary", key="btn_pf_run")
+        with _col_pf_force:
+            _pf_force = st.button("🔄 Run again w/o cache", key="btn_pf_force")
+        if _pf_run or _pf_force:
+            if _pf_force:
+                cached_pf = []
+                new_pf    = all_companies
+            pf_cache = load_prefilter_cache()
+            pf = []
 
-        # Serve cached decisions
-        for company in cached_pf:
-            entry = dict(pf_cache[_cache_key(company)])
-            pf.append(entry)
+            # Serve cached decisions
+            for company in cached_pf:
+                entry = dict(pf_cache[_cache_key(company)])
+                pf.append(entry)
 
-        # Run Claude only on new companies
-        if new_pf:
-            with st.spinner(f"Screening {len(new_pf)} new companies in one Claude call..."):
-                new_results = claude_prefilter(new_pf, anthropic_key)
-            now = datetime.now(timezone.utc).isoformat()
-            for r in new_results:
-                r["cached_at"] = now
-                pf_cache[_cache_key(r["company"])] = r
-                pf.append(r)
-            save_prefilter_cache(pf_cache)
+            # Run Claude only on new companies
+            if new_pf:
+                with st.spinner(f"Screening {len(new_pf)} new companies in one Claude call..."):
+                    new_results = claude_prefilter(new_pf, anthropic_key)
+                now = datetime.now(timezone.utc).isoformat()
+                for r in new_results:
+                    r["cached_at"] = now
+                    if not r.get("_error"):
+                        pf_cache[_cache_key(r["company"])] = r
+                    pf.append(r)
+                save_prefilter_cache(pf_cache)
 
-        # Preserve original upload order
-        order = {c: i for i, c in enumerate(all_companies)}
-        pf.sort(key=lambda r: order.get(r.get("company",""), 9999))
+            # Preserve original upload order
+            order = {c: i for i, c in enumerate(all_companies)}
+            pf.sort(key=lambda r: order.get(r.get("company",""), 9999))
 
-        st.session_state.prefilter_results = pf
-        st.session_state.company_sources   = company_sources
-        st.session_state.prefilter_done    = True
-        st.rerun()
+            st.session_state.prefilter_results = pf
+            st.session_state.company_sources   = company_sources
+            st.session_state.prefilter_done    = True
+            st.rerun()
 
 # ── Pre-filter results ────────────────────────────────────────────────────────
 if st.session_state.prefilter_done and st.session_state.stage == 0:
@@ -955,9 +1041,8 @@ if st.session_state.prefilter_done and st.session_state.stage == 0:
 
     st.markdown(f"**✅ Proceeding to Stage 1 — {len(kept)} accounts**")
     keep_df = pd.DataFrame([{
-        "Company":   r["company"],
-        "AE":        cs.get(r["company"], ""),
-        "Reasoning": r.get("detail", ""),
+        "Company": r["company"],
+        "AE":      cs.get(r["company"], ""),
     } for r in kept])
     st.dataframe(keep_df, width='stretch', hide_index=True)
 
@@ -1012,7 +1097,15 @@ if st.session_state.prefilter_done and st.session_state.stage == 0:
         if new_cos else
         f"⚡ Load Stage 1 from Cache ({len(cached_cos)} accounts)"
     )
-    if st.button(btn_label, type="primary"):
+    _col_s1_run, _col_s1_force = st.columns([3, 2])
+    with _col_s1_run:
+        _s1_run = st.button(btn_label, type="primary", key="btn_s1_run")
+    with _col_s1_force:
+        _s1_force = st.button("🔄 Run again w/o cache", key="btn_s1_force")
+    if _s1_run or _s1_force:
+        if _s1_force:
+            cached_cos = []
+            new_cos    = final_companies[:]
         s1      = []
         cache   = load_stage1_cache()
         progress = st.progress(0)
@@ -1036,11 +1129,11 @@ if st.session_state.prefilter_done and st.session_state.stage == 0:
                     r["ae_source"]  = st.session_state.company_sources.get(r.get("company",""), "")
                     r["from_cache"] = False
                     r["cached_at"]  = datetime.now(timezone.utc).isoformat()
-                    cache[_cache_key(r["company"])] = r
+                    if not r.get("_error"):
+                        cache[_cache_key(r["company"])] = r
                 s1.extend(results)
+                save_stage1_cache(cache)
                 progress.progress((len(cached_cos) + sum(len(batches[j]) for j in range(i+1))) / total)
-
-            save_stage1_cache(cache)
 
         progress.progress(1.0)
         s1.sort(key=lambda x: x.get("score", 0), reverse=True)
@@ -1062,13 +1155,25 @@ if st.session_state.stage == 1 and st.session_state.stage1_results:
     cache_now = load_stage1_cache()
     _in_single_mode = bool(st.session_state.single_account_last_run)
     if _in_single_mode:
-        st.caption("🎯 Single-account mode — Override Tier defaulted to A Strategic so the full pipeline runs regardless of score.")
+        st.caption("🎯 Single-account mode — Claude tier shown; account always proceeds to full pipeline regardless of score.")
+
+    # ── Initialise / sync overrides ───────────────────────────────────────────
+    def _default_override(r):
+        return r.get("tier","") if r.get("score",0) >= APOLLO_MIN_SCORE else "C Monitor"
+
+    for r in s1:
+        co = r.get("company","")
+        if co not in st.session_state.s1_overrides:
+            st.session_state.s1_overrides[co] = _default_override(r)
+
+    # ── Build full review df from session-state overrides ────────────────────
     review_df = pd.DataFrame([{
+        "☑":              r.get("company","") in st.session_state.s1_selection,
         "Company":        r.get("company",""),
         "AE":             r.get("ae_source",""),
         "Score":          int(r.get("score",0)),
         "Claude Tier":    r.get("tier",""),
-        "Override Tier":  "A Strategic" if _in_single_mode else (r.get("tier","") if r.get("score",0) >= APOLLO_MIN_SCORE else "C Monitor"),
+        "Override Tier":  st.session_state.s1_overrides.get(r.get("company",""), _default_override(r)),
         "Industry":       r.get("industry",""),
         "Account Type":   r.get("account_type_hint",""),
         "Triggers":       ", ".join(r.get("trigger_events",[])),
@@ -1077,17 +1182,44 @@ if st.session_state.stage == 1 and st.session_state.stage1_results:
         "Cache expires":  f"{cache_days_remaining(cache_now[_cache_key(r.get('company',''))])}d" if _cache_key(r.get("company","")) in cache_now else "—",
     } for r in s1])
 
-    show_all = st.checkbox("Show Low Priority accounts", value=False)
-    display_df = review_df if show_all else review_df[review_df["Claude Tier"] != "Low Priority"]
+    # ── Filter pills ──────────────────────────────────────────────────────────
+    _tier_counts = review_df["Override Tier"].value_counts().to_dict()
+    _filter_opts = ["All"] + [
+        f"{t} ({_tier_counts.get(t,0)})"
+        for t in ["A Strategic","B Prime","C Monitor","Low Priority","Remove"]
+        if _tier_counts.get(t,0) > 0
+    ]
+    _filter_sel = st.pills(
+        "Filter by Override Tier:",
+        _filter_opts,
+        default="All",
+        key="s1_filter_pills",
+    )
+    _active_tier = None if (not _filter_sel or _filter_sel == "All") else _filter_sel.split(" (")[0]
+    display_df = review_df if not _active_tier else review_df[review_df["Override Tier"] == _active_tier]
 
-    c1, c2 = st.columns([3,1])
-    with c2:
-        eligible = len(display_df[~display_df["Override Tier"].isin(["Low Priority","Remove"])])
-        st.metric("Proceeding to Apollo", eligible)
+    # ── Select All / Clear + Proceeding metric ────────────────────────────────
+    _col_sa, _col_ca, _col_sp, _col_metric = st.columns([1, 1, 4, 2])
+    with _col_sa:
+        if st.button("☑ Select all", key="s1_sel_all"):
+            st.session_state.s1_selection = display_df["Company"].tolist()
+            st.rerun()
+    with _col_ca:
+        if st.button("Clear", key="s1_sel_clear"):
+            st.session_state.s1_selection = []
+            st.rerun()
+    with _col_metric:
+        _eligible = len(review_df[~review_df["Override Tier"].isin(["Low Priority","Remove","C Monitor"])])
+        st.metric("Proceeding to Apollo", _eligible)
 
+    # ── Bulk action bar placeholder — rendered here, filled after data_editor ─
+    _bulk_bar_slot = st.empty()
+
+    # ── Data editor ───────────────────────────────────────────────────────────
     edited_df = st.data_editor(
         display_df,
         column_config={
+            "☑": st.column_config.CheckboxColumn("☑", default=False, width="small"),
             "Override Tier": st.column_config.SelectboxColumn(
                 "Override Tier",
                 options=["A Strategic","B Prime","C Monitor","Low Priority","Remove"],
@@ -1097,10 +1229,42 @@ if st.session_state.stage == 1 and st.session_state.stage1_results:
             "Narrative": st.column_config.TextColumn("Narrative", width="large"),
             "Triggers":  st.column_config.TextColumn("Triggers", width="medium"),
         },
+        disabled=["Company","AE","Score","Claude Tier","Industry","Account Type",
+                  "Triggers","Narrative","Source","Cache expires"],
         width='stretch',
         hide_index=True,
         key="review_editor",
     )
+
+    # Sync per-row override changes and selection back to session state
+    for _, row in edited_df.iterrows():
+        st.session_state.s1_overrides[row["Company"]] = row["Override Tier"]
+    st.session_state.s1_selection = edited_df[edited_df["☑"] == True]["Company"].tolist()
+
+    # ── Fill bulk action bar slot above the table ─────────────────────────────
+    _sel_cos = st.session_state.s1_selection
+    if _sel_cos:
+        with _bulk_bar_slot.container():
+            _bc1, _bc2, _bc3, _bc4, _bc5 = st.columns([2, 2, 2, 2, 2])
+            with _bc1:
+                st.markdown(f"**{len(_sel_cos)} selected**")
+            with _bc2:
+                st.markdown("Set Override Tier →")
+            with _bc3:
+                _bulk_tier = st.selectbox(
+                    "bulk_tier", ["A Strategic","B Prime","C Monitor","Low Priority","Remove"],
+                    key="s1_bulk_tier", label_visibility="collapsed",
+                )
+            with _bc4:
+                if st.button("Apply to selected", type="primary", key="s1_bulk_apply"):
+                    for co in _sel_cos:
+                        st.session_state.s1_overrides[co] = _bulk_tier
+                    st.session_state.s1_selection = []
+                    st.rerun()
+            with _bc5:
+                if st.button("Clear selection", key="s1_bulk_clear"):
+                    st.session_state.s1_selection = []
+                    st.rerun()
 
     # Accounts promoted to A Strategic or B Prime go to Apollo regardless of raw score.
     # Accounts scoring 25-27 default to C Monitor so they are excluded unless AE promotes them.
@@ -1134,91 +1298,101 @@ if st.session_state.stage == 1 and st.session_state.stage1_results:
 
     if not apollo_key:
         st.warning("Apollo API key not found in .env file.")
-    elif st.button(btn_s2_label, type="primary"):
-        rows     = all_rows
-        progress = st.progress(0)
-        status   = st.empty()
-        s2       = []
-        s2_cache = load_stage2_cache()
-        triggers_by_company = {r.get("company",""): r.get("trigger_events",[])
-                                for r in st.session_state.stage1_results}
+    else:
+        _col_s2_run, _col_s2_force = st.columns([3, 2])
+        with _col_s2_run:
+            _s2_run = st.button(btn_s2_label, type="primary", key="btn_s2_run")
+        with _col_s2_force:
+            _s2_force = st.button("🔄 Run again w/o cache", key="btn_s2_force")
+        if _s2_run or _s2_force:
+            if _s2_force:
+                cached_s2 = []
+                new_s2    = all_rows[:]
+            rows     = all_rows
+            progress = st.progress(0)
+            status   = st.empty()
+            s2       = []
+            s2_cache = load_stage2_cache()
+            triggers_by_company = {r.get("company",""): r.get("trigger_events",[])
+                                    for r in st.session_state.stage1_results}
 
-        run_credits = 0
+            run_credits = 0
 
-        # Serve cached accounts
-        for row in cached_s2:
-            entry = dict(s2_cache[_cache_key(row["Company"])])
-            # Update mutable fields from current run
-            entry["stage1_score"]  = row["Score"]
-            entry["stage1_tier"]   = row["Claude Tier"]
-            entry["override_tier"] = row["Override Tier"]
-            entry["from_s2_cache"] = True
-            entry["apollo_credits"] = 0  # no credits spent — served from cache
-            s2.append(entry)
-
-        # Resolve + enrich only new accounts
-        if new_s2:
-            status.text("🧠 Claude resolving company names for Apollo search...")
-            company_names = [row["Company"] for row in new_s2]
-            resolved_list = claude_resolve_names(company_names, anthropic_key, country=target_country.strip())
-            resolved_map  = {r.get("company",""): r for r in resolved_list}
-
-            for i, row in enumerate(new_s2):
-                status.text(f"🔍 Apollo enriching {i+1}/{len(new_s2)}: {row['Company']}...")
-                resolved   = resolved_map.get(row["Company"],
-                                 {"company": row["Company"], "canonical_name": row["Company"],
-                                  "domain": "", "alt_names": []})
-                apollo_org = enrich_org(resolved, apollo_key, country=target_country.strip())
-                scoring    = score_apollo(row["Score"], apollo_org)
-
-                final_tier = score_to_tier(scoring["final_score"])
-                override   = row["Override Tier"]
-                if TIER_ORDER.get(override,99) > TIER_ORDER.get(final_tier,99):
-                    final_tier = override
-
-                credits = apollo_org.get("_enrich_credits", 0) if apollo_org else 0
-                run_credits += credits
-                entry = {
-                    "company":          row["Company"],
-                    "ae_source":        row["AE"],
-                    "industry":         row["Industry"],
-                    "narrative":        row["Narrative"],
-                    "stage1_score":     row["Score"],
-                    "stage1_tier":      row["Claude Tier"],
-                    "override_tier":    override,
-                    "apollo_bonus":     scoring["bonus"],
-                    "final_score":      scoring["final_score"],
-                    "final_tier":       final_tier,
-                    "account_type":     scoring["account_type"],
-                    "sig_salesforce":   scoring["signals"].get("salesforce_in_stack", False),
-                    "sig_funding":      bool(scoring["signals"].get("recent_funding", False)),
-                    "sig_crm_hiring":   scoring["signals"].get("crm_hiring", False),
-                    "crm_job_titles":   scoring["crm_job_titles"],
-                    "technologies":     scoring["technologies"],
-                    "employees":        scoring["employees"],
-                    "funding_total":    scoring["funding_total"],
-                    "domain":           scoring["domain"] or resolved.get("domain",""),
-                    "linkedin":         scoring["linkedin"],
-                    "trigger_events":   triggers_by_company.get(row["Company"], []),
-                    "apollo_name_used": apollo_org.get("_resolved_name","") if apollo_org else "",
-                    "apollo_canonical": resolved.get("canonical_name",""),
-                    "apollo_credits":   credits,
-                    "from_s2_cache":    False,
-                    "cached_at":        datetime.now(timezone.utc).isoformat(),
-                }
+            # Serve cached accounts
+            for row in cached_s2:
+                entry = dict(s2_cache[_cache_key(row["Company"])])
+                # Update mutable fields from current run
+                entry["stage1_score"]  = row["Score"]
+                entry["stage1_tier"]   = row["Claude Tier"]
+                entry["override_tier"] = row["Override Tier"]
+                entry["from_s2_cache"] = True
+                entry["apollo_credits"] = 0  # no credits spent — served from cache
                 s2.append(entry)
-                s2_cache[_cache_key(row["Company"])] = entry
-                progress.progress((len(cached_s2) + i + 1) / len(rows))
 
-            save_stage2_cache(s2_cache)
+            # Resolve + enrich only new accounts
+            if new_s2:
+                status.text("🧠 Claude resolving company names for Apollo search...")
+                company_names = [row["Company"] for row in new_s2]
+                resolved_list = claude_resolve_names(company_names, anthropic_key, country=target_country.strip())
+                resolved_map  = {r.get("company",""): r for r in resolved_list}
 
-        progress.progress(1.0)
-        s2.sort(key=lambda x: x.get("final_score",0), reverse=True)
-        st.session_state.stage2_results  = s2
-        st.session_state.stage           = 2
-        st.session_state.s2_run_credits  = run_credits
-        status.success(f"✅ Stage 2 complete — {len(cached_s2)} from cache, {len(new_s2)} freshly enriched · 🔋 {run_credits} Apollo credits used.")
-        st.rerun()
+                for i, row in enumerate(new_s2):
+                    status.text(f"🔍 Apollo enriching {i+1}/{len(new_s2)}: {row['Company']}...")
+                    resolved   = resolved_map.get(row["Company"],
+                                     {"company": row["Company"], "canonical_name": row["Company"],
+                                      "domain": "", "alt_names": []})
+                    apollo_org = enrich_org(resolved, apollo_key, country=target_country.strip())
+                    scoring    = score_apollo(row["Score"], apollo_org)
+
+                    final_tier = score_to_tier(scoring["final_score"])
+                    override   = row["Override Tier"]
+                    if TIER_ORDER.get(override,99) < TIER_ORDER.get(final_tier,99):
+                        final_tier = override
+
+                    credits = apollo_org.get("_enrich_credits", 0) if apollo_org else 0
+                    run_credits += credits
+                    entry = {
+                        "company":          row["Company"],
+                        "ae_source":        row["AE"],
+                        "industry":         row["Industry"],
+                        "narrative":        row["Narrative"],
+                        "stage1_score":     row["Score"],
+                        "stage1_tier":      row["Claude Tier"],
+                        "override_tier":    override,
+                        "apollo_bonus":     scoring["bonus"],
+                        "final_score":      scoring["final_score"],
+                        "final_tier":       final_tier,
+                        "account_type":     scoring["account_type"],
+                        "sig_salesforce":   scoring["signals"].get("salesforce_in_stack", False),
+                        "sig_funding":      bool(scoring["signals"].get("recent_funding", False)),
+                        "sig_crm_hiring":   scoring["signals"].get("crm_hiring", False),
+                        "crm_job_titles":   scoring["crm_job_titles"],
+                        "technologies":     scoring["technologies"],
+                        "employees":        scoring["employees"],
+                        "funding_total":    scoring["funding_total"],
+                        "domain":           scoring["domain"] or resolved.get("domain",""),
+                        "linkedin":         scoring["linkedin"],
+                        "trigger_events":   triggers_by_company.get(row["Company"], []),
+                        "apollo_name_used":     apollo_org.get("_resolved_name","") if apollo_org else "",
+                        "apollo_matched_name":  apollo_org.get("name","") if apollo_org else "",
+                        "apollo_canonical":     resolved.get("canonical_name",""),
+                        "apollo_credits":   credits,
+                        "from_s2_cache":    False,
+                        "cached_at":        datetime.now(timezone.utc).isoformat(),
+                    }
+                    s2.append(entry)
+                    if not entry.get("_error"):
+                        s2_cache[_cache_key(row["Company"])] = entry
+                    save_stage2_cache(s2_cache)
+                    progress.progress((len(cached_s2) + i + 1) / len(rows))
+
+            progress.progress(1.0)
+            s2.sort(key=lambda x: x.get("final_score",0), reverse=True)
+            st.session_state.stage2_results  = s2
+            st.session_state.stage           = 2
+            st.session_state.s2_run_credits  = run_credits
+            status.success(f"✅ Stage 2 complete — {len(cached_s2)} from cache, {len(new_s2)} freshly enriched · 🔋 {run_credits} Apollo credits used.")
+            st.rerun()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1238,7 +1412,7 @@ if st.session_state.stage >= 2 and st.session_state.stage2_results:
 
     # ── Metrics ───────────────────────────────────────────────────────────────
     # In single-account mode all accounts proceed to 3a/3b regardless of tier.
-    tier_a    = s2 if _single_mode else [r for r in s2 if r["final_tier"] == "A Strategic"]
+    tier_a    = s2 if _single_mode else [r for r in s2 if r["final_tier"] in ("A Strategic", "B Prime")]
     tier_b    = [r for r in s2 if r["final_tier"] == "B Prime"]
     promoted  = [r for r in s2 if r["final_tier"] != r["stage1_tier"]]
     eb        = [r for r in s2 if "Existing" in r.get("account_type","")]
@@ -1316,10 +1490,11 @@ if st.session_state.stage >= 2 and st.session_state.stage2_results:
   <th>Domain</th><th>Alt Names</th><th>Matched On</th>
 </tr></thead><tbody>"""
             for r in resolved_rows:
-                ae_name_val = r["company"]
-                canon       = r.get("apollo_canonical","")
-                domain      = r.get("domain","")
-                matched_on  = r.get("apollo_name_used","")
+                ae_name_val   = r["company"]
+                canon         = r.get("apollo_canonical","")
+                domain        = r.get("domain","")
+                matched_on    = r.get("apollo_name_used","")
+                matched_name  = r.get("apollo_matched_name","")
                 if matched_on == canon and matched_on != ae_name_val:
                     m_cls, m_txt = "mc", "canonical"
                 elif matched_on and matched_on != canon and matched_on != ae_name_val:
@@ -1328,6 +1503,7 @@ if st.session_state.stage >= 2 and st.session_state.stage2_results:
                     m_cls, m_txt = "mo", "original"
                 else:
                     m_cls, m_txt = "mn", "no match"
+                matched_label = f'{m_txt} ({matched_name})' if matched_name and matched_name != ae_name_val else m_txt
                 domain_tag = f'<span class="dtag">{domain}</span>' if domain else "—"
                 row_bg = ' style="background:#f0fdf4"' if m_cls=="mc" and canon!=ae_name_val else \
                          ' style="background:#fffbeb"' if m_cls=="ma" else ""
@@ -1336,7 +1512,7 @@ if st.session_state.stage >= 2 and st.session_state.stage2_results:
   <td class="cn">{canon}</td>
   <td>{domain_tag}</td>
   <td>—</td>
-  <td><span class="mb {m_cls}">{m_txt}</span></td>
+  <td><span class="mb {m_cls}">{matched_label}</span></td>
 </tr>"""
             res_html += "</tbody></table>"
             st.markdown(res_html, unsafe_allow_html=True)
@@ -1486,279 +1662,353 @@ if st.session_state.stage >= 2 and st.session_state.stage2_results:
         names = " · ".join(r["company"] for r in promoted[:3])
         st.warning(f"⬆ **{len(promoted)} account(s) promoted by Apollo:** {names}")
 
-    if _single_mode:
-        st.info(f"👥 **Ready for Lead Intelligence** — single-account mode: all {len(tier_a)} account(s) proceed to Stage 3a + 3b regardless of tier.")
-    else:
-        st.info(f"👥 **Ready for Lead Intelligence** — "
-                f"**{len(tier_a)} Tier A Strategic accounts** proceed to Stage 3a + 3b.")
-
     if st.session_state.stage == 2:
         if not tier_a:
             st.error("No accounts available for Stage 3a. Review overrides above." if _single_mode else "No Tier A Strategic accounts found. Review overrides above.")
 
-        # ── Step 1: Define Buying Committees (3a) ─────────────────────────────
-        elif not st.session_state.stage3a_results:
-            st.markdown("")
-            s3a_cache   = load_stage3a_cache()
-            cached_s3a  = [a for a in tier_a if _cache_key(a["company"]) in s3a_cache]
-            new_s3a     = [a for a in tier_a if _cache_key(a["company"]) not in s3a_cache]
-            col_s3a_c, col_s3a_n, col_s3a_t = st.columns(3)
-            col_s3a_c.metric("⚡ From cache", len(cached_s3a))
-            col_s3a_n.metric("✨ New to Claude", len(new_s3a))
-            col_s3a_t.metric("Total", len(tier_a))
-            if cached_s3a:
-                st.caption(f"✅ {len(cached_s3a)} account(s) have buying committees cached in the last {CACHE_TTL_DAYS} days — only {len(new_s3a)} new accounts will go to Claude.")
-            if not anthropic_key:
-                st.warning("Enter your Anthropic API key in the sidebar to proceed.")
-            elif st.button("🧠 Define Buying Committees — Stage 3a", type="primary"):
-                progress = st.progress(0)
-                status   = st.empty()
-                personas = []
-
-                # Serve cached accounts instantly
-                for a in cached_s3a:
-                    personas.append(s3a_cache[_cache_key(a["company"])])
-
-                # Run Claude only for new accounts
-                if new_s3a:
-                    status.text("🧠 Claude defining buying committees...")
-                    batches = [new_s3a[i:i+BATCH_SIZE] for i in range(0, len(new_s3a), BATCH_SIZE)]
-                    for i, batch in enumerate(batches):
-                        results = claude_stage3a(batch, anthropic_key)
-                        for r in results:
-                            r["cached_at"] = datetime.now(timezone.utc).isoformat()
-                            s3a_cache[_cache_key(r["company"])] = r
-                        personas.extend(results)
-                        progress.progress((len(cached_s3a) + sum(len(batches[j]) for j in range(i+1))) / len(tier_a))
-                    save_stage3a_cache(s3a_cache)
-
-                progress.progress(1.0)
-                st.session_state.stage3a_results = {p["company"]: p for p in personas}
-                status.success(f"✅ Buying committees defined — {len(cached_s3a)} from cache, {len(new_s3a)} freshly scored.")
-                st.rerun()
-
-        # ── Step 2: Review gate + Run People Search (3b) ──────────────────────
+        # ── Account selection gate ─────────────────────────────────────────────
         else:
-            personas_map = st.session_state.stage3a_results
-
             st.markdown("---")
-            st.subheader("🧠 Stage 3a — Buying Committee Review")
-            st.caption("Review the buying committees Claude defined before Apollo people search runs. "
-                       "Expand any account to see personas, outreach angle, and why-now context.")
+            st.subheader("🎯 Stage 3a — Select Accounts for Lead Intelligence")
+            st.caption("Check the accounts you want to send to Stage 3a + 3b. Uncheck any you want to skip this run.")
+
+            # Default: all tier_a selected (reset when tier_a changes)
+            tier_a_names = [a["company"] for a in tier_a]
+            if not st.session_state.stage3a_selected:
+                st.session_state.stage3a_selected = tier_a_names[:]
+
+            # Select All / Clear All
+            _col_sa, _col_ca, _ = st.columns([1, 1, 6])
+            with _col_sa:
+                if st.button("☑ Select All", key="btn_s3a_select_all"):
+                    st.session_state.stage3a_selected = tier_a_names[:]
+                    st.rerun()
+            with _col_ca:
+                if st.button("Clear All", key="btn_s3a_clear_all"):
+                    st.session_state.stage3a_selected = []
+                    st.rerun()
+
+            # Selection table
+            def _signals(a):
+                parts = []
+                if a.get("sig_salesforce"):   parts.append("Salesforce")
+                if a.get("sig_funding"):       parts.append("Funding")
+                if a.get("sig_crm_hiring"):    parts.append("CRM hiring")
+                if a.get("trigger_events"):    parts.extend(a["trigger_events"][:1])
+                return ", ".join(parts[:3])
+
+            sel_set = set(st.session_state.stage3a_selected)
+            sel_df = pd.DataFrame([{
+                "☑ Include":  a["company"] in sel_set,
+                "Company":    a["company"],
+                "Score":      int(a.get("final_score", 0)),
+                "Tier":       a.get("final_tier", a.get("override_tier", "")),
+                "Type":       a.get("account_type", ""),
+                "Signals":    _signals(a),
+            } for a in tier_a])
+
+            edited_sel = st.data_editor(
+                sel_df,
+                column_config={"☑ Include": st.column_config.CheckboxColumn("☑ Include", default=True)},
+                disabled=["Company","Score","Tier","Type","Signals"],
+                hide_index=True,
+                width="stretch",
+                key="s3a_selector",
+            )
+
+            selected_companies = edited_sel[edited_sel["☑ Include"] == True]["Company"].tolist()
+            st.session_state.stage3a_selected = selected_companies
+            skipped_companies  = [a["company"] for a in tier_a if a["company"] not in set(selected_companies)]
+            selected_tier_a    = [a for a in tier_a if a["company"] in set(selected_companies)]
 
             # Metrics
-            all_personas   = [p for pd in personas_map.values()
-                               for p in pd.get("buying_committee", [])]
-            hot_personas   = [p for p in all_personas if p.get("priority") == "Hot"]
-            nh_accounts    = [c for c, pd in personas_map.items()
-                              if any(te for te in st.session_state.stage3a_results.get(c,{})
-                                     .get("buying_committee",[]))]
-            total_personas = len(all_personas)
-            apollo_est     = total_personas  # 1 call per persona
+            _mc1, _mc2, _mc3 = st.columns(3)
+            _mc1.metric("Total eligible", len(tier_a))
+            _mc2.metric("Selected",       len(selected_companies))
+            _mc3.metric("Skipped",        len(skipped_companies))
+            if skipped_companies:
+                st.caption(f"⏭ Skipped: {', '.join(skipped_companies)}")
 
-            mc1, mc2, mc3, mc4 = st.columns(4)
-            mc1.metric("Accounts",        len(tier_a))
-            mc2.metric("Hot Personas",    len(hot_personas))
-            mc3.metric("Total Personas",  total_personas)
-            mc4.metric("Apollo Calls Est.", apollo_est)
+            # ── Step 1: Define Buying Committees (3a) ─────────────────────────
+            if not st.session_state.stage3a_results:
+                st.markdown("")
+                s3a_cache   = load_stage3a_cache()
+                cached_s3a  = [a for a in selected_tier_a if _cache_key(a["company"]) in s3a_cache]
+                new_s3a     = [a for a in selected_tier_a if _cache_key(a["company"]) not in s3a_cache]
+                col_s3a_c, col_s3a_n, col_s3a_t = st.columns(3)
+                col_s3a_c.metric("⚡ From cache", len(cached_s3a))
+                col_s3a_n.metric("✨ New to Claude", len(new_s3a))
+                col_s3a_t.metric("Total", len(selected_tier_a))
+                if cached_s3a:
+                    st.caption(f"✅ {len(cached_s3a)} account(s) have buying committees cached in the last {CACHE_TTL_DAYS} days — only {len(new_s3a)} new accounts will go to Claude.")
+                if not anthropic_key:
+                    st.warning("Enter your Anthropic API key in the sidebar to proceed.")
+                elif not selected_tier_a:
+                    st.warning("Select at least one account to proceed.")
+                else:
+                    _col_s3a_run, _col_s3a_force = st.columns([3, 2])
+                    with _col_s3a_run:
+                        _lbl = f"🧠 Define Buying Committees — Stage 3a ({len(selected_tier_a)} account{'s' if len(selected_tier_a)!=1 else ''})"
+                        _s3a_run = st.button(_lbl, type="primary", key="btn_s3a_run")
+                    with _col_s3a_force:
+                        _s3a_force = st.button("🔄 Run again w/o cache", key="btn_s3a_force")
+                    if _s3a_run or _s3a_force:
+                        if _s3a_force:
+                            cached_s3a = []
+                            new_s3a    = selected_tier_a[:]
+                        progress = st.progress(0)
+                        status   = st.empty()
+                        personas = []
 
-            # Per-account expanders
-            priority_icon = {"Hot": "🔴", "Warm": "🟡", "Cold": "🟢"}
-            role_colors   = {"Power Lead": "#b91c1c", "Sponsor Lead": "#1d4ed8"}
+                        # Serve cached accounts instantly
+                        for a in cached_s3a:
+                            personas.append(s3a_cache[_cache_key(a["company"])])
 
-            for account in tier_a:
-                p_data    = personas_map.get(account["company"], {})
-                committee = p_data.get("buying_committee", [])
-                hot_count = sum(1 for p in committee if p.get("priority") == "Hot")
-                nh_flag   = any(te for te in account.get("trigger_events", [])
-                                if "hire" in te.lower() or "cio" in te.lower()
-                                or "cdo" in te.lower() or "cco" in te.lower())
+                        # Run Claude only for new accounts
+                        if new_s3a:
+                            status.text("🧠 Claude defining buying committees...")
+                            batches = [new_s3a[i:i+BATCH_SIZE] for i in range(0, len(new_s3a), BATCH_SIZE)]
+                            for i, batch in enumerate(batches):
+                                results = claude_stage3a(batch, anthropic_key)
+                                for r in results:
+                                    r["cached_at"] = datetime.now(timezone.utc).isoformat()
+                                    if not r.get("_error"):
+                                        s3a_cache[_cache_key(r["company"])] = r
+                                personas.extend(results)
+                                save_stage3a_cache(s3a_cache)
+                                progress.progress((len(cached_s3a) + sum(len(batches[j]) for j in range(i+1))) / len(selected_tier_a))
 
-                header = (f"{'🟢' if account['final_tier']=='A Strategic' else '🔵'} "
-                          f"**{account['company']}** · Score {account['final_score']} · "
-                          f"{len(committee)} personas"
-                          + (f" · 🔴 {hot_count} Hot" if hot_count else "")
-                          + (" · 🆕 trigger" if nh_flag else ""))
+                        progress.progress(1.0)
+                        st.session_state.stage3a_results = {p["company"]: p for p in personas}
+                        status.success(f"✅ Buying committees defined — {len(cached_s3a)} from cache, {len(new_s3a)} freshly scored.")
+                        st.rerun()
 
-                with st.expander(header):
-                    col_intel, col_personas = st.columns([1, 2])
+            # ── Step 2: Review gate + Run People Search (3b) ──────────────────
+            else:
+                personas_map = st.session_state.stage3a_results
 
-                    with col_intel:
-                        st.markdown(f"""
-**Tier:** {account.get('final_tier','')}
-**Industry:** {account.get('industry','')}
-**Account Type:** {account.get('account_type','')}
-**Angle:** {p_data.get('outreach_angle','')}
-**Why Now:** {p_data.get('why_now','')}
-**Value Pillar:** {p_data.get('value_pillar','')}
-""")
-                    with col_personas:
-                        if committee:
-                            cards_html = ""
-                            for p in committee:
-                                pri   = p.get("priority", "Warm")
-                                icon  = priority_icon.get(pri, "🟡")
-                                role  = p.get("role_type", "")
-                                rc    = role_colors.get(role, "#6b7280")
-                                titles_html = "".join(
-                                    f'<span style="font-size:10px;background:#f1f5f9;color:#6b7280;'
-                                    f'padding:1px 6px;border-radius:4px;margin:1px;'
-                                    f'display:inline-block">{t}</span>'
-                                    for t in p.get("search_titles", [])
-                                )
-                                bg = "#fff9f9" if pri=="Hot" else "#fffdf5" if pri=="Warm" else "#f9fafb"
-                                bc = "#fecaca" if pri=="Hot" else "#fde68a" if pri=="Warm" else "#f1f5f9"
-                                cards_html += f"""
-<div style="border:1px solid {bc};background:{bg};border-radius:8px;
-            padding:9px 12px;margin-bottom:7px">
-  <div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">
-    <span style="font-size:14px">{icon}</span>
-    <span style="font-weight:700;font-size:13px;color:#111827">{p.get('persona','')}</span>
-    <span style="font-size:9px;font-weight:700;padding:1px 6px;border-radius:6px;
-                 background:{rc}22;color:{rc}">{role}</span>
-  </div>
-  <div style="font-size:12px;color:#374151;margin-bottom:5px">{p.get('why','')}</div>
-  <div style="display:flex;flex-wrap:wrap;gap:3px">{titles_html}</div>
-</div>"""
-                            st.markdown(cards_html, unsafe_allow_html=True)
-                        else:
-                            st.caption("No committee defined.")
+                st.markdown("---")
+                st.subheader("🧠 Stage 3a — Buying Committee Review")
+                st.caption("Review the buying committees Claude defined before Apollo people search runs. "
+                           "Expand any account to see personas, outreach angle, and why-now context.")
 
-            # Run 3b button
-            st.markdown("")
-            if not apollo_key:
-                st.warning("Enter your Apollo API key in the sidebar to run people search.")
-            elif st.button("👥 Run People Search — Stage 3b", type="primary"):
-                progress = st.progress(0)
-                status   = st.empty()
-                s3_run_credits = 0
+                # Metrics
+                all_personas   = [p for pd in personas_map.values()
+                                   for p in pd.get("buying_committee", [])]
+                hot_personas   = [p for p in all_personas if p.get("priority") == "Hot"]
+                nh_accounts    = [c for c, pd in personas_map.items()
+                                  if any(te for te in st.session_state.stage3a_results.get(c,{})
+                                         .get("buying_committee",[]))]
+                total_personas = len(all_personas)
+                apollo_est     = total_personas  # 1 call per persona
 
-                # ── Pre-build per-account state ───────────────────────────────
-                # Separating state from the loop allows the three-pass sweep to
-                # accumulate leads across passes without re-initialising per account.
-                acct_state = {}
-                for acct in tier_a:
-                    p_data    = personas_map.get(acct["company"], {})
+                mc1, mc2, mc3, mc4 = st.columns(4)
+                mc1.metric("Accounts",        len(selected_tier_a))
+                mc2.metric("Hot Personas",    len(hot_personas))
+                mc3.metric("Total Personas",  total_personas)
+                mc4.metric("Apollo Calls Est.", apollo_est)
+
+                # Per-account expanders
+                priority_icon = {"Hot": "🔴", "Warm": "🟡", "Cold": "🟢"}
+                role_colors   = {"Power Lead": "#b91c1c", "Sponsor Lead": "#1d4ed8"}
+
+                for account in selected_tier_a:
+                    p_data    = personas_map.get(account["company"], {})
                     committee = p_data.get("buying_committee", [])
-                    acct_state[acct["company"]] = {
-                        "p_data":          p_data,
-                        "committee":       committee,
-                        "search_personas": committee if committee else [
-                            {"priority": "Hot",  "role_type": "Power Lead",   "search_titles": FALLBACK_HOT_TITLES},
-                            {"priority": "Warm", "role_type": "Sponsor Lead", "search_titles": FALLBACK_WARM_TITLES},
-                        ],
-                        "search_name":     acct.get("apollo_name_used") or acct["company"],
-                        "all_leads":       [],
-                        "seen_names":      set(),
-                        "seen_ids":        set(),   # shared across personas — prevents duplicate unlocks
-                        "acct_credits":    0,
-                        "probed":          False,
-                        "has_people":      True,
-                    }
+                    hot_count = sum(1 for p in committee if p.get("priority") == "Hot")
+                    nh_flag   = any(te for te in account.get("trigger_events", [])
+                                    if "hire" in te.lower() or "cio" in te.lower()
+                                    or "cdo" in te.lower() or "cco" in te.lower())
 
-                # ── Three-pass priority sweep ─────────────────────────────────
-                # Hot pass → all accounts first, then Warm, then Cold.
-                # Every account gets its most important leads before any account
-                # gets its secondary leads. Credit cap stops the sweep globally
-                # but never skips an account that hasn't been visited yet in
-                # the current pass.
-                total_steps = len(tier_a) * 3
-                step        = 0
-                cap_reached = False
+                    header = (f"{'🟢' if account['final_tier']=='A Strategic' else '🔵'} "
+                              f"**{account['company']}** · Score {account['final_score']} · "
+                              f"{len(committee)} personas"
+                              + (f" · 🔴 {hot_count} Hot" if hot_count else "")
+                              + (" · 🆕 trigger" if nh_flag else ""))
 
-                for priority_pass in ["Hot", "Warm", "Cold"]:
-                    if cap_reached:
-                        break
-                    status.text(f"👥 {priority_pass} pass — scanning {len(tier_a)} accounts...")
-                    for acct in tier_a:
-                        step += 1
-                        progress.progress(step / total_steps)
-                        st_a = acct_state[acct["company"]]
+                    with st.expander(header):
+                        col_intel, col_personas = st.columns([1, 2])
 
-                        # Global cap check
-                        if s3_run_credits >= S3B_CREDIT_CAP:
-                            status.warning(f"⚠️ Credit cap of {S3B_CREDIT_CAP} reached after {priority_pass} pass.")
-                            cap_reached = True
+                        with col_intel:
+                            st.markdown(f"""
+    **Tier:** {account.get('final_tier','')}
+    **Industry:** {account.get('industry','')}
+    **Account Type:** {account.get('account_type','')}
+    **Angle:** {p_data.get('outreach_angle','')}
+    **Why Now:** {p_data.get('why_now','')}
+    **Value Pillar:** {p_data.get('value_pillar','')}
+    """)
+                        with col_personas:
+                            if committee:
+                                cards_html = ""
+                                for p in committee:
+                                    pri   = p.get("priority", "Warm")
+                                    icon  = priority_icon.get(pri, "🟡")
+                                    role  = p.get("role_type", "")
+                                    rc    = role_colors.get(role, "#6b7280")
+                                    titles_html = "".join(
+                                        f'<span style="font-size:10px;background:#f1f5f9;color:#6b7280;'
+                                        f'padding:1px 6px;border-radius:4px;margin:1px;'
+                                        f'display:inline-block">{t}</span>'
+                                        for t in p.get("search_titles", [])
+                                    )
+                                    bg = "#fff9f9" if pri=="Hot" else "#fffdf5" if pri=="Warm" else "#f9fafb"
+                                    bc = "#fecaca" if pri=="Hot" else "#fde68a" if pri=="Warm" else "#f1f5f9"
+                                    cards_html += f"""
+    <div style="border:1px solid {bc};background:{bg};border-radius:8px;
+                padding:9px 12px;margin-bottom:7px">
+      <div style="display:flex;align-items:center;gap:6px;margin-bottom:3px">
+        <span style="font-size:14px">{icon}</span>
+        <span style="font-weight:700;font-size:13px;color:#111827">{p.get('persona','')}</span>
+        <span style="font-size:9px;font-weight:700;padding:1px 6px;border-radius:6px;
+                     background:{rc}22;color:{rc}">{role}</span>
+      </div>
+      <div style="font-size:12px;color:#374151;margin-bottom:5px">{p.get('why','')}</div>
+      <div style="display:flex;flex-wrap:wrap;gap:3px">{titles_html}</div>
+    </div>"""
+                                st.markdown(cards_html, unsafe_allow_html=True)
+                            else:
+                                st.caption("No committee defined.")
+
+                # Run 3b button
+                st.markdown("")
+                if not apollo_key:
+                    st.warning("Enter your Apollo API key in the sidebar to run people search.")
+                elif st.button("👥 Run People Search — Stage 3b", type="primary"):
+                    progress = st.progress(0)
+                    status   = st.empty()
+                    s3_run_credits = 0
+
+                    # ── Pre-build per-account state ───────────────────────────────
+                    # Separating state from the loop allows the three-pass sweep to
+                    # accumulate leads across passes without re-initialising per account.
+                    acct_state = {}
+                    for acct in selected_tier_a:
+                        p_data    = personas_map.get(acct["company"], {})
+                        committee = p_data.get("buying_committee", [])
+                        acct_state[acct["company"]] = {
+                            "p_data":          p_data,
+                            "committee":       committee,
+                            "search_personas": committee if committee else [
+                                {"priority": "Hot",  "role_type": "Power Lead",   "search_titles": FALLBACK_HOT_TITLES},
+                                {"priority": "Warm", "role_type": "Sponsor Lead", "search_titles": FALLBACK_WARM_TITLES},
+                            ],
+                            "search_name":     acct.get("apollo_name_used") or acct["company"],
+                            "all_leads":       [],
+                            "seen_names":      set(),
+                            "seen_ids":        set(),   # shared across personas — prevents duplicate unlocks
+                            "acct_credits":    0,
+                            "probed":          False,
+                            "has_people":      True,
+                        }
+
+                    # ── Three-pass priority sweep ─────────────────────────────────
+                    # Hot pass → all accounts first, then Warm, then Cold.
+                    # Every account gets its most important leads before any account
+                    # gets its secondary leads. Credit cap stops the sweep globally
+                    # but never skips an account that hasn't been visited yet in
+                    # the current pass.
+                    total_steps = len(selected_tier_a) * 3
+                    step        = 0
+                    cap_reached = False
+
+                    for priority_pass in ["Hot", "Warm", "Cold"]:
+                        if cap_reached:
                             break
+                        status.text(f"👥 {priority_pass} pass — scanning {len(selected_tier_a)} accounts...")
+                        for acct in selected_tier_a:
+                            step += 1
+                            progress.progress(step / total_steps)
+                            st_a = acct_state[acct["company"]]
 
-                        # Pre-probe once per account (first pass only, free call)
-                        if not st_a["probed"]:
-                            st_a["probed"] = True
-                            try:
-                                probe = apollo_post("mixed_people/api_search", {
-                                    "q_organization_name": st_a["search_name"], "page": 1, "per_page": 1
-                                }, apollo_key)
-                                if not probe.get("people"):
-                                    st_a["has_people"] = False
-                                    st.caption(f"⚠️ {acct['company']} — no people indexed in Apollo, skipping.")
-                            except Exception:
-                                pass  # probe failed — proceed anyway
-
-                        if not st_a["has_people"]:
-                            continue
-
-                        # Search only personas matching this pass's priority
-                        for persona in st_a["search_personas"]:
-                            if persona.get("priority") != priority_pass:
-                                continue
-                            titles = persona.get("search_titles", [])
-                            if not titles:
-                                continue
+                            # Global cap check
                             if s3_run_credits >= S3B_CREDIT_CAP:
+                                status.warning(f"⚠️ Credit cap of {S3B_CREDIT_CAP} reached after {priority_pass} pass.")
                                 cap_reached = True
                                 break
 
-                            people, unlock_credits = search_people(
-                                st_a["search_name"], acct.get("domain", ""),
-                                titles, apollo_key, max_results=2,
-                                priority=priority_pass,
-                                seen_ids=st_a["seen_ids"],
-                            )
-                            s3_run_credits        += unlock_credits
-                            st_a["acct_credits"]  += unlock_credits
+                            # Pre-probe once per account (first pass only, free call)
+                            if not st_a["probed"]:
+                                st_a["probed"] = True
+                                try:
+                                    probe = apollo_post("mixed_people/api_search", {
+                                        "q_organization_name": st_a["search_name"], "page": 1, "per_page": 1
+                                    }, apollo_key)
+                                    if not probe.get("people") and acct.get("domain"):
+                                        probe = apollo_post("mixed_people/api_search", {
+                                            "organization_domains": [acct["domain"]], "page": 1, "per_page": 1
+                                        }, apollo_key)
+                                    if not probe.get("people"):
+                                        st_a["has_people"] = False
+                                        st.caption(f"⚠️ {acct['company']} — no people indexed in Apollo, skipping.")
+                                except Exception:
+                                    pass  # probe failed — proceed anyway
 
-                            for person in people:
-                                name = person.get("name", "")
-                                if name and name not in st_a["seen_names"]:
-                                    new_hire, hire_date = is_new_hire(person)
-                                    st_a["all_leads"].append({
-                                        "name":         name,
-                                        "title":        person.get("title", ""),
-                                        "email":        person.get("email", ""),
-                                        "email_status": person.get("email_status", ""),
-                                        "linkedin":     person.get("linkedin_url", ""),
-                                        "seniority":    person.get("seniority", ""),
-                                        "priority":     priority_pass,
-                                        "role_type":    persona.get("role_type", ""),
-                                        "new_hire":     new_hire,
-                                        "hire_date":    hire_date or "",
-                                    })
-                                    st_a["seen_names"].add(name)
+                            if not st_a["has_people"]:
+                                continue
 
-                # ── Build final s3 results from accumulated state ─────────────
-                s3 = []
-                for acct in tier_a:
-                    st_a   = acct_state[acct["company"]]
-                    p_data = st_a["p_data"]
-                    leads  = sorted(st_a["all_leads"],
-                                    key=lambda l: {"Hot":0,"Warm":1,"Cold":2}.get(l.get("priority","Cold"), 2))
-                    s3.append({
-                        **acct,
-                        "buying_committee": st_a["committee"],
-                        "outreach_angle":   p_data.get("outreach_angle", ""),
-                        "why_now":          p_data.get("why_now", ""),
-                        "value_pillar":     p_data.get("value_pillar", ""),
-                        "leads":            leads,
-                        "unlock_credits":   st_a["acct_credits"],
-                    })
+                            # Search only personas matching this pass's priority
+                            for persona in st_a["search_personas"]:
+                                if persona.get("priority") != priority_pass:
+                                    continue
+                                titles = persona.get("search_titles", [])
+                                if not titles:
+                                    continue
+                                if s3_run_credits >= S3B_CREDIT_CAP:
+                                    cap_reached = True
+                                    break
 
-                s3.sort(key=lambda x: x.get("final_score", 0), reverse=True)
-                st.session_state.stage3_results = s3
-                st.session_state.stage          = 3
-                st.session_state.s3_run_credits = s3_run_credits
-                total_leads = sum(len(r["leads"]) for r in s3)
-                status.success(f"✅ Lead intelligence complete — {total_leads} leads found across {len(s3)} accounts · 🔋 {s3_run_credits} Apollo unlock credits used.")
-                st.rerun()
+                                people, unlock_credits = search_people(
+                                    st_a["search_name"], acct.get("domain", ""),
+                                    titles, apollo_key, max_results=2,
+                                    priority=priority_pass,
+                                    seen_ids=st_a["seen_ids"],
+                                )
+                                s3_run_credits        += unlock_credits
+                                st_a["acct_credits"]  += unlock_credits
+
+                                for person in people:
+                                    name = person.get("name", "")
+                                    if name and name not in st_a["seen_names"]:
+                                        new_hire, hire_date = is_new_hire(person)
+                                        st_a["all_leads"].append({
+                                            "name":         name,
+                                            "title":        person.get("title", ""),
+                                            "email":        person.get("email", ""),
+                                            "email_status": person.get("email_status", ""),
+                                            "linkedin":     person.get("linkedin_url", ""),
+                                            "seniority":    person.get("seniority", ""),
+                                            "priority":     priority_pass,
+                                            "role_type":    persona.get("role_type", ""),
+                                            "new_hire":     new_hire,
+                                            "hire_date":    hire_date or "",
+                                        })
+                                        st_a["seen_names"].add(name)
+
+                    # ── Build final s3 results from accumulated state ─────────────
+                    s3 = []
+                    for acct in selected_tier_a:
+                        st_a   = acct_state[acct["company"]]
+                        p_data = st_a["p_data"]
+                        leads  = sorted(st_a["all_leads"],
+                                        key=lambda l: {"Hot":0,"Warm":1,"Cold":2}.get(l.get("priority","Cold"), 2))
+                        s3.append({
+                            **acct,
+                            "buying_committee": st_a["committee"],
+                            "outreach_angle":   p_data.get("outreach_angle", ""),
+                            "why_now":          p_data.get("why_now", ""),
+                            "value_pillar":     p_data.get("value_pillar", ""),
+                            "leads":            leads,
+                            "unlock_credits":   st_a["acct_credits"],
+                        })
+
+                    s3.sort(key=lambda x: x.get("final_score", 0), reverse=True)
+                    st.session_state.stage3_results = s3
+                    st.session_state.stage          = 3
+                    st.session_state.s3_run_credits = s3_run_credits
+                    total_leads = sum(len(r["leads"]) for r in s3)
+                    status.success(f"✅ Lead intelligence complete — {total_leads} leads found across {len(s3)} accounts · 🔋 {s3_run_credits} Apollo unlock credits used.")
+                    st.rerun()
 
 
 # ════════════════════════════════════════════════════════════════════════════════
@@ -1904,7 +2154,8 @@ if st.session_state.stage >= 4:
         for k, default in [
             ("stage",0), ("prefilter_done",False), ("prefilter_results",[]),
             ("company_sources",{}), ("stage1_results",[]), ("stage2_results",[]),
-            ("stage3a_results",{}), ("stage3_results",[]), ("stage4_results",[]),
+            ("s1_overrides",{}), ("s1_selection",[]),
+            ("stage3a_results",{}), ("stage3a_selected",[]), ("stage3_results",[]), ("stage4_results",[]),
         ]:
             st.session_state[k] = default
         st.rerun()

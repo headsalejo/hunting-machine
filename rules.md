@@ -2,12 +2,18 @@
 
 ---
 
+## Theme
+
+A **🌙 Dark / ☀️ Light** segmented control sits at the top of the sidebar. Switching writes the new `base` value to `.streamlit/config.toml` and triggers a full browser reload so Streamlit re-reads the theme. Session state resets on theme switch (pipeline cache files are unaffected). Default theme is dark.
+
+---
+
 ## Sidebar Controls
 
 | Field | Behaviour when filled | Behaviour when blank |
 |-------|----------------------|---------------------|
 | **Country/region priority** | Adds `organization_locations` filter to Apollo's `mixed_companies/search` — surfaces local entity over group (e.g. "Spain" → Axactor Spain instead of Axactor Group) | No location filter applied — default Apollo behaviour |
-| **Run only for this account** | Bypasses uploaded file and pre-filter entirely. Resets all pipeline state automatically when the company name changes — no browser refresh needed. Override Tier at Stage 1 is forced to A Strategic regardless of score. Stage 3a and 3b tier filter is bypassed — all accounts from Stage 2 proceed regardless of final tier. | Normal uploaded-list flow |
+| **Run only for this account** | Bypasses uploaded file and pre-filter entirely. Resets all pipeline state automatically when the company name changes — no browser refresh needed. Override Tier at Stage 1 defaults to Claude's scored tier (same logic as batch mode). Stage 3a and 3b tier filter is bypassed — all accounts from Stage 2 proceed regardless of final tier. | Normal uploaded-list flow |
 
 ---
 
@@ -57,6 +63,7 @@ One single Claude call processes the entire uploaded list.
 - On each run, accounts found in cache are loaded instantly — only new accounts go to Claude
 - Cache status (⚡ From cache / ✨ New to Claude / Total) shown after pre-filter, before the Stage 1 button
 - Cache entries expire automatically after 7 days
+- **Error results are never cached** — if any Claude API call fails (e.g. insufficient credits, timeout), the result is not written to cache and will be retried on the next run. Applies to all cache layers: pre-filter, Stage 1, Stage 2, and Stage 3a
 
 ### 🏢 Account Scoring (Max 50 Points)
 
@@ -115,12 +122,20 @@ One single Claude call processes the entire uploaded list.
 ## STAGE 1 → STAGE 2 GATE — Manual Review
 
 Before Apollo credits are spent, accounts must be reviewed:
-- AE confirms or overrides Claude tier via the Override Tier dropdown
+- AE confirms or overrides Claude tier via the Override Tier dropdown (per-row) or bulk action bar
 - Manager promotes/demotes accounts based on relationship context
 - Accounts flagged as "Remove" are excluded
 - **Only accounts with Override Tier = A Strategic or B Prime proceed to Apollo**
 - Accounts scoring ≥ 28 default to their Claude tier in the Override column
 - Accounts scoring 25–27 default to C Monitor — AE must explicitly promote to B Prime or A Strategic to include them in Apollo
+
+### Bulk override controls
+- **Filter pills** — narrow the table to a single tier (A Strategic / B Prime / C Monitor / Low Priority / Remove); counts update live as overrides change
+- **☑ Select all** — selects all rows currently visible (respects active filter)
+- **Clear** — deselects all rows
+- **Bulk action bar** — appears only when ≥1 row is checked; AE picks a target tier and clicks "Apply to selected"; clears selection after apply
+- Per-row Override Tier dropdowns remain fully functional alongside bulk actions
+- Override state stored in `s1_overrides` session dict; persists across filter changes and reruns until pipeline reset
 
 ---
 
@@ -154,7 +169,8 @@ If **Country/region priority** is set in the sidebar, it is passed to Claude's n
 2. Try `canonical_name` (Claude's resolved form)
 3. Try each `alt_name` in order
 4. Stop at first Apollo hit that passes domain cross-validation — record which name matched
-5. If all fail → no Apollo data, Stage 1 score stands
+5. If all name variants fail → domain-direct fallback: call `organizations/enrich` directly with Claude's predicted domain (bypasses name search entirely; costs 1 credit if it returns data)
+6. If fallback also fails → no Apollo data, Stage 1 score stands
 
 ### Design Principles
 - One Claude Sonnet batch call for all accounts — Sonnet is used (not Haiku) because entity knowledge quality directly gates enrichment accuracy
@@ -208,6 +224,19 @@ layer, not a dependency.
 | Salesforce in tech stack confirmed | Existing Business → Expansion angle |
 | Competitor CRM in tech stack | Green Field → Displacement angle |
 | No CRM detected / Apollo no data | Green Field → Transformation angle (default) |
+
+---
+
+## STAGE 2 → STAGE 3a GATE — Account Selection
+
+Before Stage 3a runs, a selection table is always shown listing all eligible accounts (Tier A Strategic, or all accounts in single-account mode). AE checks/unchecks individual accounts to control which ones proceed to Stage 3a + 3b.
+
+- **Select All** / **Clear All** buttons for bulk actions
+- Unselected accounts are skipped and listed in a "⏭ Skipped" caption
+- The run button label reflects the selected count: "Define Buying Committees — Stage 3a (N accounts)"
+- If no accounts are selected, the run button is replaced with a warning
+- Stage 3b operates on the same selection used in Stage 3a — accounts not in `stage3a_results` are excluded
+- `stage3a_selected` in session state persists the selection; cleared on pipeline reset and "Start New Run"
 
 ---
 
@@ -270,6 +299,8 @@ Stage 3b processes all accounts in three global passes rather than exhausting ea
 | Pass 3 — Cold | Manager, operational influencer | Full list scanned last — skipped entirely if cap reached |
 
 **Per-page buffer**: `search_people` fetches `max_results + 1` candidates per Apollo call (was `max_results + 4`) — tighter buffer reduces unlock exposure while still providing one overflow candidate for validation headroom.
+
+**Company search per_page**: `enrich_org` fetches `per_page: 20` results per name candidate from `mixed_companies/search` and scans all ranked results for the first domain-passing hit before moving to the next candidate name. This recovers cases where the correct entity (e.g. JD Sports Iberia / jdsports.es) is ranked below a parent/holding company (e.g. JD Sports Fashion / jdplc.com) that fails domain cross-validation. Apollo's API has a non-linear result threshold — per_page values below ~10 suppress lower-ranked results even when they exist; per_page=20 is used as a safe margin.
 
 **Shared deduplication**: A `seen_ids` set is shared across all persona calls within the same account. A person that matches multiple personas is only unlocked once — no duplicate credit spend.
 
